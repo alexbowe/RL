@@ -148,15 +148,6 @@ class SglangSpecificArgs(TypedDict):
     # --- Server warmup ---
     # Skip the post-startup warmup pass.
     skip_server_warmup: NotRequired[bool]
-    # --- Fault tolerance (NeMo-RL `RolloutHealthMonitor`, not native SGLang) ---
-    # Run a background thread that health-checks each engine and kills hung actors.
-    use_fault_tolerance: NotRequired[bool]
-    # Seconds between health-check probes.
-    rollout_health_check_interval: NotRequired[int]
-    # Per-probe timeout in seconds.
-    rollout_health_check_timeout: NotRequired[int]
-    # Grace period (seconds) before the first probe after engine start.
-    rollout_health_check_first_wait: NotRequired[int]
 
 
 class SGLangServerConfig(TypedDict):

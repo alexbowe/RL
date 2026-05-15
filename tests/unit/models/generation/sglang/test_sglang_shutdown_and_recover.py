@@ -81,9 +81,3 @@ def test_new_worker_after_shutdown(ray_cluster, router):
     w2 = create_worker(router, base_gpu_id=0, tp_size=1, rank=0)
     assert ray.get(w2.health_generate.remote()) is True
     ray.get(w2.shutdown.remote())
-
-
-def test_simulate_crash(ray_cluster, router):
-    """_simulate_crash (which calls shutdown) does not raise."""
-    worker = create_worker(router, base_gpu_id=0, tp_size=1, rank=0)
-    ray.get(worker._simulate_crash.remote())

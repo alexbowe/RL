@@ -564,17 +564,6 @@ class SGLangGenerationWorker:
         response.raise_for_status()
         return response
 
-    def _simulate_crash(self):
-        """Test-only: tear the engine down to simulate a crash.
-
-        Underscore-prefixed to signal this is **not** part of the public
-        worker API; production code should never call it.
-        """
-        logger.info(
-            f"Simulating crash on engine {self.server_host}:{self.server_port}..."
-        )
-        self.shutdown()
-
     # ---------------------------------------------------------------------------
     # Compatible with parent class or old interfaces
     # ---------------------------------------------------------------------------

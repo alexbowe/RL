@@ -21,7 +21,6 @@ from nemo_rl.models.generation.interfaces import (
     verify_right_padding,
 )
 from nemo_rl.models.generation.sglang.config import SGLangConfig
-from nemo_rl.models.generation.sglang.fault_tolerance import RolloutHealthMonitor
 from nemo_rl.models.generation.sglang.sglang_router import _start_router
 from nemo_rl.models.generation.sglang.sglang_worker import SGLangGenerationWorker
 from nemo_rl.models.generation.sglang.utils.async_utils import AsyncLoopThread
@@ -59,7 +58,6 @@ class SGLangGeneration(GenerationInterface):
     ):
         self.cluster = cluster
         self.sglang_cfg = sglang_cfg
-        self._health_monitor = None
         self._async_loop: AsyncLoopThread | None = AsyncLoopThread()
         self._http_client: HttpClient | None = None
 
@@ -84,7 +82,6 @@ class SGLangGeneration(GenerationInterface):
         self.num_gpus_per_engine: int = gpus_per_engine
         self.num_gpus_per_node: int = num_gpus_per_node
         self.all_engines: list = [None] * num_engines
-        self.num_new_engines: int = 0
         # It will be useful for future features which involve pd disaggregation, mixture sglang config setup
         self.rank_offset: int = 0
         self.gpu_offset: int = 0
@@ -112,11 +109,6 @@ class SGLangGeneration(GenerationInterface):
         init_handles, _ = self._start_engines({})
         if init_handles:
             ray.get(init_handles)
-
-        if sglang_cfg["sglang_cfg"].get("use_fault_tolerance"):
-            monitor = RolloutHealthMonitor(self, sglang_cfg)
-            monitor.start()
-            self._health_monitor = monitor
 
     # ------------------------------------------------------------------
     # Engine topology properties (formerly ``ServerGroup``)
@@ -235,9 +227,7 @@ class SGLangGeneration(GenerationInterface):
             local_all_engines.append((global_rank, engine))
             self.all_engines[i] = engine
 
-        self.num_new_engines = len(local_all_engines)
-
-        if self.num_new_engines == 0:
+        if len(local_all_engines) == 0:
             return [], port_cursors
 
         base_port = max(port_cursors.values()) if port_cursors else 15000
@@ -259,44 +249,9 @@ class SGLangGeneration(GenerationInterface):
         ]
         return init_handles, port_cursors
 
-    def _recover(self) -> None:
-        """Recover dead engines, overlapping init."""
-        dead_indices = [
-            i for i, engine in enumerate(self.all_engines) if engine is None
-        ]
-
-        port_cursors: dict[int, int] = {}
-        handles, _ = self._start_engines(port_cursors)
-        if handles:
-            ray.get(handles)
-
-        assert self.num_new_engines == len(dead_indices), (
-            "num_new_engines does not match dead_indices length"
-        )
-
-        if self.needs_offload and dead_indices:
-            new_engines = [self.all_engines[i] for i in dead_indices]
-            ray.get([engine.release_memory_weights.remote() for engine in new_engines])
-            ray.get(
-                [
-                    engine.release_memory_kv_cache_and_cuda_graph.remote()
-                    for engine in new_engines
-                ]
-            )
-            ray.get([engine.resume_memory_weights.remote() for engine in new_engines])
-
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
-    def get_updatable_engines(self):
-        """Return engines eligible for weight updates."""
-        return (
-            self.engines,
-            self.num_new_engines,
-            self.engine_gpu_counts,
-            self.engine_gpu_offsets,
-        )
-
     def offload_weights(self):
         if not self.needs_offload:
             return
@@ -345,26 +300,6 @@ class SGLangGeneration(GenerationInterface):
         if handles:
             ray.get(handles)
 
-    def recover_updatable_engines(self):
-        """Restart any dead rollout engines and update ``num_new_engines``.
-
-        for weight-update detection.
-        """
-        self.health_monitoring_pause()
-
-        self._recover()
-
-        return (
-            self.engines,
-            self.num_new_engines,
-            self.engine_gpu_counts,
-            self.engine_gpu_offsets,
-        )
-
-    def clear_updatable_num_new_engines(self):
-        # when fault tolerance is not enabled, we need to manually clear num_new_engines after update_weights
-        self.num_new_engines = 0
-
     def check_weights(self, action: str):
         """All node-0 engines across all servers / models."""
         return ray.get(
@@ -394,18 +329,7 @@ class SGLangGeneration(GenerationInterface):
             return
         ray.get([e.continue_generation.remote() for e in engines])
 
-    def health_monitoring_pause(self) -> None:
-        if self._health_monitor:
-            self._health_monitor.pause()
-
-    def health_monitoring_resume(self) -> None:
-        if self._health_monitor:
-            self._health_monitor.resume()
-
     def shutdown(self) -> bool:
-        if self._health_monitor:
-            self._health_monitor.stop()
-
         ok = True
         engines = [e for e in self.all_engines if e is not None]
         if engines:
@@ -879,12 +803,8 @@ class SGLangGeneration(GenerationInterface):
                 if "kv_cache" in tags:
                     self.onload_kv()
 
-        self.health_monitoring_resume()
-
     def finish_generation(self, *args: Any, **kwargs: Any) -> bool:
         """Sleep workers and reset prefix cache."""
-        self.health_monitoring_pause()
-
         tags = kwargs.get("tags", None)
         if self.needs_offload:
             if tags is None:
