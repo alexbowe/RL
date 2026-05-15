@@ -317,6 +317,9 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
             TokenizeCompletionRequest,
             TokenizeResponse,
         )
+        from vllm.entrypoints.serve.render.serving import (
+            OpenAIServingRender,
+        )
         from vllm.entrypoints.serve.tokenize.serving import (
             OpenAIServingTokenization,
         )
@@ -472,11 +475,18 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
         class NeMoRLOpenAIServingChat(NeMoRLOpenAIServingMixin, OpenAIServingChat):
             pass
 
+        openai_serving_render = OpenAIServingRender(
+            model_config=engine_client.model_config,
+            renderer=engine_client.renderer,
+            model_registry=openai_serving_models.registry,
+        )
+
         serving_chat_default_kwargs = dict(
             response_role="assistant",
             request_logger=None,
             chat_template=None,
             chat_template_content_format="auto",
+            openai_serving_render=openai_serving_render,
         )
         serving_chat_kwargs = serving_chat_default_kwargs | self.cfg["vllm_cfg"].get(
             "http_server_serving_chat_kwargs", dict()
