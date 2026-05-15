@@ -129,6 +129,7 @@ def create_worker(router_info, base_gpu_id=0, tp_size=1, rank=0):
             dist_init_addr=f"{host_ip}:{dist_init_port}",
             port=port,
             nccl_port=nccl_port,
+            host=host_ip,
             router_ip=router_info["ip"],
             router_port=router_info["port"],
         )

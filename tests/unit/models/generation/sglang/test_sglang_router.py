@@ -30,7 +30,7 @@ pytestmark = pytest.mark.sglang
 
 def _start_and_cleanup(actor, router_cfg):
     """Start a router, return (ip, port), register cleanup on failure."""
-    ip, port = ray.get(actor.start.remote(router_cfg))
+    ip, port = ray.get(actor.init.remote(router_cfg))
     return ip, port
 
 
@@ -77,7 +77,7 @@ def test_start_finds_port_when_not_configured(ray_cluster):
 def test_stop_terminates_process(ray_cluster):
     """stop() completes without error after a successful start."""
     actor = RouterActor.remote()
-    ray.get(actor.start.remote({}))
+    ray.get(actor.init.remote({}))
     ray.get(actor.stop.remote())  # should not raise
     ray.kill(actor)
 

@@ -11,41 +11,52 @@ from nemo_rl.models.generation.sglang.config import SGLangConfig
 logger = logging.getLogger(__name__)
 
 
-async def _post(client, url, payload, max_retries=10, action="post"):
-    retry_count = 0
-    while retry_count < max_retries:
-        try:
-            if action in ("delete", "get"):
-                assert not payload
-                response = await getattr(client, action)(url)
-            else:
-                response = await getattr(client, action)(url, json=payload or {})
-            response.raise_for_status()
+@ray.remote
+class _HttpPosterActor:
+    def __init__(self, concurrency: int):
+        # Lazy creation to this actor's event loop
+        self._client = httpx.AsyncClient(
+            limits=httpx.Limits(max_connections=max(1, concurrency)),
+            timeout=httpx.Timeout(None),
+        )
+
+    async def do_post(self, url, payload, max_retries=3, action="post"):
+        retry_count = 0
+        while retry_count < max_retries:
             try:
-                output = response.json()
-            except json.JSONDecodeError:
-                output = response.text
-        except Exception as e:
-            retry_count += 1
+                if action in ("delete", "get"):
+                    assert not payload
+                    response = await getattr(self._client, action)(url)
+                else:
+                    response = await getattr(self._client, action)(
+                        url, json=payload or {}
+                    )
+                response.raise_for_status()
+                try:
+                    output = response.json()
+                except json.JSONDecodeError:
+                    output = response.text
+            except Exception as e:
+                retry_count += 1
 
-            if isinstance(e, httpx.HTTPStatusError):
-                response_text = e.response.text
-            else:
-                response_text = None
+                if isinstance(e, httpx.HTTPStatusError):
+                    response_text = e.response.text
+                else:
+                    response_text = None
 
-            logger.info(
-                f"Error: {e}, retrying... (attempt {retry_count}/{max_retries}, url={url}, response={response_text})"
-            )
-            if retry_count >= max_retries:
                 logger.info(
-                    f"Max retries ({max_retries}) reached, failing... (url={url})"
+                    f"Error: {e}, retrying... (attempt {retry_count}/{max_retries}, url={url}, response={response_text})"
                 )
-                raise e
-            await asyncio.sleep(1)
-            continue
-        break
+                if retry_count >= max_retries:
+                    logger.info(
+                        f"Max retries ({max_retries}) reached, failing... (url={url})"
+                    )
+                    raise e
+                await asyncio.sleep(1)
+                continue
+            break
 
-    return output
+        return output
 
 
 class HttpClient:
@@ -111,20 +122,6 @@ class HttpClient:
         if not nodes:
             raise RuntimeError("No alive Ray nodes to place HTTP POST actors.")
 
-        @ray.remote
-        class _HttpPosterActor:
-            def __init__(self, concurrency: int):
-                # Lazy creation to this actor's event loop
-                self._client = httpx.AsyncClient(
-                    limits=httpx.Limits(max_connections=max(1, concurrency)),
-                    timeout=httpx.Timeout(None),
-                )
-
-            async def do_post(self, url, payload, max_retries=10, action="post"):
-                return await _post(
-                    self._client, url, payload, max_retries, action=action
-                )
-
         created = []
         per_actor_conc = max(1, (self._client_concurrency + len(nodes)) // len(nodes))
 
@@ -144,7 +141,7 @@ class HttpClient:
 
         self._post_actors = created
 
-    async def post(self, url, payload, max_retries=10, action="post"):
+    async def post(self, url, payload, max_retries=3, action="post"):
         if self._distributed_post_enabled and self._post_actors:
             try:
                 actor = self._next_actor()
@@ -160,7 +157,44 @@ class HttpClient:
                 )
                 # fall through to local
 
-        return await _post(self._get_client(), url, payload, max_retries, action=action)
+        return await self._post_local(url, payload, max_retries, action=action)
+
+    async def _post_local(self, url, payload, max_retries=3, action="post"):
+        client = self._get_client()
+        retry_count = 0
+        while retry_count < max_retries:
+            try:
+                if action in ("delete", "get"):
+                    assert not payload
+                    response = await getattr(client, action)(url)
+                else:
+                    response = await getattr(client, action)(url, json=payload or {})
+                response.raise_for_status()
+                try:
+                    output = response.json()
+                except json.JSONDecodeError:
+                    output = response.text
+            except Exception as e:
+                retry_count += 1
+
+                if isinstance(e, httpx.HTTPStatusError):
+                    response_text = e.response.text
+                else:
+                    response_text = None
+
+                logger.info(
+                    f"Error: {e}, retrying... (attempt {retry_count}/{max_retries}, url={url}, response={response_text})"
+                )
+                if retry_count >= max_retries:
+                    logger.info(
+                        f"Max retries ({max_retries}) reached, failing... (url={url})"
+                    )
+                    raise e
+                await asyncio.sleep(1)
+                continue
+            break
+
+        return output
 
     async def get(self, url):
         response = await self._get_client().get(url)
@@ -188,8 +222,3 @@ class HttpClient:
         if self._client is not None:
             await self._client.aclose()
             self._client = None
-
-
-def init_http_client(args: SGLangConfig) -> HttpClient:
-    """Create an HTTP client for SGLang requests."""
-    return HttpClient(args)

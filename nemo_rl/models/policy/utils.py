@@ -511,7 +511,7 @@ def stream_weights_via_http_impl(
         worker_state: Mutable dict on the worker used to cache topology and
             weight version across refits.
     """
-    from nemo_rl.models.policy.torch_reductions_utils import (
+    from nemo_rl.models.generation.sglang.utils.train_utils import (
         FlattenedTensorBucket,
         MultiprocessingSerializer,
         monkey_patch_torch_reductions,

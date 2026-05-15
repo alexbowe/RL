@@ -87,7 +87,7 @@ def ray_cluster():
 def router(ray_cluster):
     """Start a real sglang router that lives for the session."""
     actor = RouterActor.remote()
-    ip, port = ray.get(actor.start.remote({}))
+    ip, port = ray.get(actor.init.remote({}))
     yield {"actor": actor, "ip": ip, "port": port}
     try:
         ray.get(actor.stop.remote())

@@ -18,18 +18,13 @@ These tests verify basic functionality of helper utilities and do NOT
 require a running SGLang server or GPU.
 """
 
-import multiprocessing
-
+from nemo_rl.models.generation.sglang.utils.ip_port_utils import _wrap_ipv6
 from nemo_rl.models.generation.sglang.utils.ray_utils import (
-    _wrap_ipv6,
     find_available_port,
     get_host_info,
     is_port_available,
 )
-from nemo_rl.models.generation.sglang.utils.router_utils import (
-    terminate_process,
-)
-from nemo_rl.models.policy.torch_reductions_utils import (
+from nemo_rl.models.generation.sglang.utils.train_utils import (
     MultiprocessingSerializer,
 )
 
@@ -81,10 +76,3 @@ def test_serializer_roundtrip():
     assert deserialized == obj
 
 
-def test_terminate_process_already_dead():
-    """terminate_process does not raise when the process is already dead."""
-    p = multiprocessing.Process(target=lambda: None)
-    p.start()
-    p.join()
-    # Process has already exited — should be a harmless no-op
-    terminate_process(p)

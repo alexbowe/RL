@@ -38,10 +38,7 @@ from helpers import (
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
-from nemo_rl.models.generation.sglang.sglang_generation import (
-    SGLangGeneration,
-    generate_one_sample,
-)
+from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 
 MODEL_PATH = "Qwen/Qwen3-4B"
 
@@ -379,7 +376,7 @@ def test_generate_one_sample_returns_correct_tuple(sglang_gen, tokenizer):
     input_ids = tokenizer.encode("The capital of France is")
 
     result = asyncio.run(
-        generate_one_sample(
+        sglang_gen.generate_one_sample(
             sglang_gen.router_ip, sglang_gen.router_port, sp, input_ids, index=42
         )
     )

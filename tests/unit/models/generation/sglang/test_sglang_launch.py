@@ -27,7 +27,6 @@ import ray
 import requests
 from helpers import create_worker
 
-from nemo_rl.models.generation.sglang.utils.ray_utils import Lock
 
 pytestmark = pytest.mark.sglang
 
@@ -68,29 +67,3 @@ def test_workers_have_distinct_urls(two_workers):
     assert len(set(urls)) == 2
     for url in urls:
         assert url.startswith("http://")
-
-
-# ------------------------------------------------------------------
-# Lock actor
-# ------------------------------------------------------------------
-def test_lock_actor_acquire_release(ray_cluster):
-    """Lock.acquire / release round-trip works."""
-    lock = Lock.options(num_cpus=0.1, num_gpus=0).remote()
-    try:
-        assert ray.get(lock.acquire.remote()) is True
-        ray.get(lock.release.remote())
-    finally:
-        ray.kill(lock)
-
-
-def test_lock_actor_mutual_exclusion(ray_cluster):
-    """A second acquire fails while the lock is held."""
-    lock = Lock.options(num_cpus=0.1, num_gpus=0).remote()
-    try:
-        assert ray.get(lock.acquire.remote()) is True
-        assert ray.get(lock.acquire.remote()) is False  # already held
-        ray.get(lock.release.remote())
-        assert ray.get(lock.acquire.remote()) is True  # free again
-        ray.get(lock.release.remote())
-    finally:
-        ray.kill(lock)

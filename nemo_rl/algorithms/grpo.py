@@ -583,9 +583,6 @@ def setup(
             cluster=inference_cluster,
             sglang_cfg=generation_config,
         )
-        if generation_config["sglang_server"].get("check_weight_update_equal", False):
-            pg.check_weights(action="snapshot")
-            pg.check_weights(action="reset")
         pg.finish_generation()
         return pg, time.perf_counter() - t0
 
@@ -754,22 +751,6 @@ def setup(
     state_dict_info = policy.prepare_refit_info()
     if policy_generation is not None:
         policy_generation.prepare_refit_info(state_dict_info)
-
-    if backend == "sglang" and isinstance(policy_generation, SGLangGeneration):
-        sglang_cfg_typed = cast(SGLangConfig, generation_config)
-        check_equal = sglang_cfg_typed["sglang_server"].get(
-            "check_weight_update_equal", False
-        )
-        if check_equal:
-            refit_policy_generation(
-                policy=policy,
-                policy_generation=policy_generation,
-                colocated_inference=colocated_inference,
-            )
-            policy_generation.check_weights(action="compare")
-            policy_generation.finish_generation()
-
-            policy.prepare_for_training()
 
     # Calculate total setup time
     total_setup_time = time.perf_counter() - setup_start_time

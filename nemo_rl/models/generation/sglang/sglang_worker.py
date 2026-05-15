@@ -1,4 +1,3 @@
-import ipaddress
 import logging
 import multiprocessing
 import os
@@ -9,10 +8,10 @@ import ray
 import requests
 from urllib3.exceptions import NewConnectionError
 
+from nemo_rl.models.generation.sglang.utils.ip_port_utils import _format_v6_uri
 from nemo_rl.models.generation.sglang.utils.ray_utils import (
     get_current_node_ip,
     get_free_port,
-    get_host_info,
 )
 
 logger = logging.getLogger(__name__)
@@ -61,12 +60,14 @@ def _patch_sglang_safe_unpickler() -> None:
     with open(file_to_patch, "r") as f:
         content = f.read()
 
-    sentinel = '"nemo_rl.models.policy.torch_reductions_utils."'
+    sentinel = '"nemo_rl.models.generation.sglang.utils.train_utils."'
     if sentinel in content:
         return
 
     anchor = '        "torch.nn.parameter.",\n'
-    insertion = anchor + '        "nemo_rl.models.policy.torch_reductions_utils.",\n'
+    insertion = (
+        anchor + '        "nemo_rl.models.generation.sglang.utils.train_utils.",\n'
+    )
     if anchor not in content:
         raise RuntimeError(
             f"SafeUnpickler allowlist anchor '{anchor.strip()}' not found in "
@@ -175,90 +176,6 @@ def _apply_sglang_compat_patches() -> None:
     _patch_megatron_training_hook_mode()
 
 
-def get_base_gpu_id(gpus_per_node: int, sglang_cfg, rank):
-    num_gpus = min(gpus_per_node, sglang_cfg["sglang_server"]["num_gpus_per_engine"])
-    start_index = (rank * num_gpus) % gpus_per_node
-    return start_index
-
-
-def _to_local_gpu_id(physical_gpu_id: int) -> int:
-    cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
-    if not cvd:
-        return physical_gpu_id  # no remapping
-    # CUDA_VISIBLE_DEVICES can be like "4,5,6,7"
-    visible = [int(x) for x in cvd.split(",") if x.strip() != ""]
-    # In a remapped process, valid torch device indices are 0..len(visible)-1
-    if physical_gpu_id in visible:
-        return visible.index(physical_gpu_id)
-    # If we're already getting local IDs, allow them
-    if 0 <= physical_gpu_id < len(visible):
-        return physical_gpu_id
-    raise RuntimeError(
-        f"GPU id {physical_gpu_id} is not valid under CUDA_VISIBLE_DEVICES={cvd}. "
-        f"Expected one of {visible} (physical) or 0..{len(visible) - 1} (local)."
-    )
-
-
-def launch_server_process(server_args) -> multiprocessing.Process:
-    from sglang.srt.entrypoints.http_server import launch_server
-
-    multiprocessing.set_start_method("spawn", force=True)
-    server_args.host = server_args.host.strip("[]")
-    p = multiprocessing.Process(target=launch_server, args=(server_args,))
-    p.start()
-
-    if server_args.node_rank != 0:
-        return p
-
-    _wait_server_healthy(
-        base_url=server_args.url(),
-        api_key=server_args.api_key,
-        process_alive_fn=lambda: p.is_alive(),
-    )
-
-    return p
-
-
-def _wait_server_healthy(
-    base_url: str,
-    api_key: str | None,
-    process_alive_fn: Callable[[], bool],
-) -> None:
-    headers = {
-        "Content-Type": "application/json; charset=utf-8",
-        "Authorization": f"Bearer {api_key}",
-    }
-
-    with requests.Session() as session:
-        while True:
-            try:
-                response = session.get(f"{base_url}/health_generate", headers=headers)
-                if response.status_code == 200:
-                    break
-            except requests.RequestException:
-                pass
-
-            if not process_alive_fn():
-                raise Exception("Server process terminated unexpectedly.")
-
-            time.sleep(2)
-
-        # use flush_cache to make sure the working queue is empty, so that we can do offload
-        while True:
-            try:
-                response = session.get(f"{base_url}/flush_cache", headers=headers)
-                if response.status_code == 200:
-                    break
-
-            except requests.RequestException:
-                pass
-
-            if not process_alive_fn():
-                raise Exception("Server process terminated unexpectedly.")
-
-            time.sleep(2)
-
-
 @ray.remote  # pragma: no cover
 class SGLangGenerationWorker:
     def __init__(
@@ -281,39 +198,19 @@ class SGLangGenerationWorker:
         dist_init_addr,
         port,
         nccl_port,
-        host=None,
-        router_ip=None,
-        router_port=None,
+        host,
+        router_ip,
+        router_port,
     ):
 
-        self.router_ip = (
-            router_ip
-            if router_ip is not None
-            else self.sglang_cfg["sglang_router"]["sglang_router_ip"]
-        )
-        self.router_port = (
-            router_port
-            if router_port is not None
-            else self.sglang_cfg["sglang_router"]["sglang_router_port"]
-        )
-
-        host = host or get_host_info()[1]
-
-        def _format_v6_uri(addr):
-            if not addr or addr.startswith("["):
-                return addr
-            try:
-                if ipaddress.ip_address(addr).version == 6:
-                    return f"[{addr}]"
-            except ValueError:
-                pass
-            return addr
+        self.router_ip = router_ip
+        self.router_port = router_port
 
         host = _format_v6_uri(host)
         ip_part, port_part = dist_init_addr.rsplit(":", 1)
         dist_init_addr = f"{_format_v6_uri(ip_part)}:{port_part}"
 
-        server_args_dict = _compute_server_args(
+        server_args_dict = self._compute_server_args(
             self.gpus_per_node,
             self.sglang_cfg,
             self.rank,
@@ -330,15 +227,30 @@ class SGLangGenerationWorker:
         self.server_port = server_args_dict["port"]
         self.server_base_url = f"http://{self.server_host}:{self.server_port}"
 
-        self._init_normal(server_args_dict)
+        self._launch_server_process(server_args_dict)
 
-    def _init_normal(self, server_args_dict):
+    def _launch_server_process(self, server_args_dict):
+        from sglang.srt.entrypoints.http_server import launch_server
         from sglang.srt.server_args import ServerArgs
 
         logger.info(
             f"Launch HttpServerEngineAdapter at: {self.server_host}:{self.server_port}"
         )
-        self.process = launch_server_process(ServerArgs(**server_args_dict))
+
+        server_args = ServerArgs(**server_args_dict)
+        multiprocessing.set_start_method("spawn", force=True)
+        server_args.host = server_args.host.strip("[]")
+        p = multiprocessing.Process(target=launch_server, args=(server_args,))
+        p.start()
+
+        if server_args.node_rank == 0:
+            self._wait_server_healthy(
+                base_url=server_args.url(),
+                api_key=server_args.api_key,
+                process_alive_fn=lambda: p.is_alive(),
+            )
+
+        self.process = p
 
         if self.node_rank == 0 and self.router_ip and self.router_port:
             payload = {
@@ -709,76 +621,132 @@ class SGLangGenerationWorker:
             time.sleep(1)
         raise TimeoutError("Timeout while flushing cache.")
 
+    # ----------------------------------------------------------------------------
+    # Compute Server args
+    # ----------------------------------------------------------------------------
+    def _compute_server_args(
+        self,
+        gpus_per_node: int,
+        sglang_cfg,
+        rank,
+        dist_init_addr,
+        nccl_port,
+        host,
+        port,
+        base_gpu_id: int | None = None,
+        num_gpus_per_engine: int | None = None,
+    ):
+        _gpus_per_engine = (
+            num_gpus_per_engine or sglang_cfg["sglang_server"]["num_gpus_per_engine"]
+        )
+        nnodes = max(1, _gpus_per_engine // gpus_per_node)
+        node_rank = rank % nnodes
+        base = self._to_local_gpu_id(base_gpu_id)
+        kwargs = {
+            "model_path": sglang_cfg["sglang_cfg"]["model_path"],
+            "trust_remote_code": True,
+            "random_seed": sglang_cfg["sglang_cfg"]["random_seed"] + rank,
+            # memory
+            "enable_memory_saver": sglang_cfg["sglang_server"]["needs_offload"],
+            "enable_weights_cpu_backup": sglang_cfg["sglang_server"][
+                "cpu_weight_backup"
+            ],
+            # distributed
+            "host": host,
+            "port": port,
+            "nccl_port": nccl_port,
+            "nnodes": nnodes,
+            "node_rank": node_rank,
+            "dist_init_addr": dist_init_addr,
+            "gpu_id_step": 1,
+            "base_gpu_id": base,
+            # parallel
+            "tp_size": _gpus_per_engine,
+            "dp_size": sglang_cfg["sglang_cfg"]["dp_size"],
+            "pp_size": sglang_cfg["sglang_cfg"]["pp_size"],
+            "ep_size": sglang_cfg["sglang_cfg"]["ep_size"],
+            # always skip warmup to prevent warmup timeout.
+            "skip_server_warmup": sglang_cfg["sglang_cfg"]["skip_server_warmup"],
+            # always enable draft weights cpu backup so that we run training without mtp weights.
+            "enable_draft_weights_cpu_backup": True,
+        }
 
-# ----------------------------------------------------------------------------
-# Compute Server args
-# ----------------------------------------------------------------------------
-def _compute_server_args(
-    gpus_per_node: int,
-    sglang_cfg,
-    rank,
-    dist_init_addr,
-    nccl_port,
-    host,
-    port,
-    base_gpu_id: int | None = None,
-    num_gpus_per_engine: int | None = None,
-):
-    _gpus_per_engine = (
-        num_gpus_per_engine or sglang_cfg["sglang_server"]["num_gpus_per_engine"]
-    )
-    nnodes = max(1, _gpus_per_engine // gpus_per_node)
-    node_rank = rank % nnodes
-    base = (
-        base_gpu_id
-        if base_gpu_id is not None
-        else get_base_gpu_id(gpus_per_node, sglang_cfg, rank)
-    )
-    base = _to_local_gpu_id(base)
-    kwargs = {
-        "model_path": sglang_cfg["sglang_cfg"]["model_path"],
-        "trust_remote_code": True,
-        "random_seed": sglang_cfg["sglang_cfg"]["random_seed"] + rank,
-        # memory
-        "enable_memory_saver": sglang_cfg["sglang_server"]["needs_offload"],
-        "enable_weights_cpu_backup": sglang_cfg["sglang_server"]["cpu_weight_backup"],
-        # distributed
-        "host": host,
-        "port": port,
-        "nccl_port": nccl_port,
-        "nnodes": nnodes,
-        "node_rank": node_rank,
-        "dist_init_addr": dist_init_addr,
-        "gpu_id_step": 1,
-        "base_gpu_id": base,
-        # parallel
-        "tp_size": _gpus_per_engine,
-        "dp_size": sglang_cfg["sglang_cfg"]["dp_size"],
-        "pp_size": sglang_cfg["sglang_cfg"]["pp_size"],
-        "ep_size": sglang_cfg["sglang_cfg"]["ep_size"],
-        # always skip warmup to prevent warmup timeout.
-        "skip_server_warmup": sglang_cfg["sglang_cfg"]["skip_server_warmup"],
-        # always enable draft weights cpu backup so that we run training without mtp weights.
-        "enable_draft_weights_cpu_backup": True,
-    }
+        for key in [
+            "dtype",
+            "kv_cache_dtype",
+            "context_length",
+            "max_running_requests",
+            "chunked_prefill_size",
+            "max_prefill_tokens",
+            "schedule_policy",
+            "schedule_conservativeness",
+            "cpu_offload_gb",
+            "log_level",
+            "mem_fraction_static",
+            "allow_auto_truncate",
+            "disable_piecewise_cuda_graph",
+            "disable_cuda_graph",
+        ]:
+            if key in sglang_cfg["sglang_cfg"]:
+                kwargs[key] = sglang_cfg["sglang_cfg"][key]
 
-    for key in [
-        "dtype",
-        "kv_cache_dtype",
-        "context_length",
-        "max_running_requests",
-        "chunked_prefill_size",
-        "max_prefill_tokens",
-        "schedule_policy",
-        "schedule_conservativeness",
-        "cpu_offload_gb",
-        "log_level",
-        "mem_fraction_static",
-        "allow_auto_truncate",
-        "disable_piecewise_cuda_graph",
-        "disable_cuda_graph",
-    ]:
-        if key in sglang_cfg["sglang_cfg"]:
-            kwargs[key] = sglang_cfg["sglang_cfg"][key]
+        return kwargs
 
-    return kwargs
+    def _to_local_gpu_id(self, physical_gpu_id: int) -> int:
+        cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
+        if not cvd:
+            return physical_gpu_id  # no remapping
+        # CUDA_VISIBLE_DEVICES can be like "4,5,6,7"
+        visible = [int(x) for x in cvd.split(",") if x.strip() != ""]
+        # In a remapped process, valid torch device indices are 0..len(visible)-1
+        if physical_gpu_id in visible:
+            return visible.index(physical_gpu_id)
+        # If we're already getting local IDs, allow them
+        if 0 <= physical_gpu_id < len(visible):
+            return physical_gpu_id
+        raise RuntimeError(
+            f"GPU id {physical_gpu_id} is not valid under CUDA_VISIBLE_DEVICES={cvd}. "
+            f"Expected one of {visible} (physical) or 0..{len(visible) - 1} (local)."
+        )
+
+    def _wait_server_healthy(
+        self,
+        base_url: str,
+        api_key: str | None,
+        process_alive_fn: Callable[[], bool],
+    ) -> None:
+        headers = {
+            "Content-Type": "application/json; charset=utf-8",
+            "Authorization": f"Bearer {api_key}",
+        }
+
+        with requests.Session() as session:
+            while True:
+                try:
+                    response = session.get(
+                        f"{base_url}/health_generate", headers=headers
+                    )
+                    if response.status_code == 200:
+                        break
+                except requests.RequestException:
+                    pass
+
+                if not process_alive_fn():
+                    raise Exception("Server process terminated unexpectedly.")
+
+                time.sleep(2)
+
+            # use flush_cache to make sure the working queue is empty, so that we can do offload
+            while True:
+                try:
+                    response = session.get(f"{base_url}/flush_cache", headers=headers)
+                    if response.status_code == 200:
+                        break
+
+                except requests.RequestException:
+                    pass
+
+                if not process_alive_fn():
+                    raise Exception("Server process terminated unexpectedly.")
+
+                time.sleep(2)

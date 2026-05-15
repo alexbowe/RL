@@ -1,10 +1,28 @@
 import logging
+import multiprocessing
 
 import ray
 
-from nemo_rl.models.generation.sglang.config import SGLangRouter
+from nemo_rl.distributed.ray_actor_environment_registry import SGLANG_EXECUTABLE
+from nemo_rl.models.generation.sglang.config import SGLangRouterConfig
 
 logger = logging.getLogger(__name__)
+
+
+def run_router(args):
+    try:
+        from sglang_router.launch_router import launch_router
+
+        router = launch_router(args)
+        if router is None:
+            return 1
+        return 0
+    except Exception:
+        # Runs inside a subprocess; surface the full traceback at ERROR level
+        # so it isn't filtered by INFO config, and re-raise so the subprocess
+        # exits non-zero (caller asserts on ``_process.is_alive()``).
+        logger.exception("sglang router failed to launch")
+        raise
 
 
 @ray.remote(num_cpus=1, num_gpus=0)
@@ -16,18 +34,17 @@ class RouterActor:
     (router_ip, router_port) without ever importing sglang_router itself.
     """
 
-    def start(self, router_cfg: SGLangRouter) -> tuple[str, int]:
-        import multiprocessing
+    def init(self, router_cfg: SGLangRouterConfig) -> tuple[str, int]:
         import random
+        import time
 
         from sglang_router.launch_router import RouterArgs
 
+        from nemo_rl.models.generation.sglang.utils.ip_port_utils import _wrap_ipv6
         from nemo_rl.models.generation.sglang.utils.ray_utils import (
-            _wrap_ipv6,
             find_available_port,
             get_host_info,
         )
-        from nemo_rl.models.generation.sglang.utils.router_utils import run_router
 
         router_ip = _wrap_ipv6(get_host_info()[1])
         router_port = router_cfg.get("sglang_router_port")
@@ -48,16 +65,50 @@ class RouterActor:
         self._process = multiprocessing.Process(target=run_router, args=(router_args,))
         self._process.daemon = True
         self._process.start()
-        import time
 
         time.sleep(3)
         assert self._process.is_alive(), "Router process died on startup"
         return router_ip, router_port
 
-    def stop(self):
-        from nemo_rl.models.generation.sglang.utils.router_utils import (
-            terminate_process,
-        )
+    def stop(self, timeout: float = 1.0) -> None:
+        """Terminate the router subprocess gracefully, with forced kill as fallback.
 
-        if hasattr(self, "_process"):
-            terminate_process(self._process)
+        Args:
+            timeout: Seconds to wait for graceful termination before forcing kill.
+        """
+        if not hasattr(self, "_process") or not self._process.is_alive():
+            return
+
+        self._process.terminate()
+        self._process.join(timeout=timeout)
+        if self._process.is_alive():
+            self._process.kill()
+            self._process.join()
+
+
+def _start_router(
+    router_cfg: SGLangRouterConfig,
+) -> tuple[str, int, ray.actor.ActorHandle | None]:
+    """Start sgl router, returning ``(router_ip, router_port, actor_handle)``.
+
+    When ``router_cfg.use_external_router`` is True, reuse the externally
+    launched router at ``(sglang_router_ip, sglang_router_port)`` and return
+    ``actor_handle=None`` (we do not own that router and must not terminate it).
+    Otherwise spawn a ``RouterActor`` in sglang env to own the router process.
+    """
+    if router_cfg.get("use_external_router"):
+        assert (
+            router_cfg.get("sglang_router_ip") is not None
+            and router_cfg.get("sglang_router_port") is not None
+        ), (
+            "sglang_router_ip and sglang_router_port must both be set "
+            "when use_external_router is True"
+        )
+        return router_cfg["sglang_router_ip"], router_cfg["sglang_router_port"], None
+
+    router_actor = RouterActor.options(
+        runtime_env={"py_executable": SGLANG_EXECUTABLE},
+    ).remote()
+    router_ip, router_port = ray.get(router_actor.init.remote(dict(router_cfg)))
+    logger.info(f"Router launched at {router_ip}:{router_port}")
+    return router_ip, router_port, router_actor

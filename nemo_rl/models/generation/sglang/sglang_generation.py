@@ -22,16 +22,15 @@ from nemo_rl.models.generation.interfaces import (
 )
 from nemo_rl.models.generation.sglang.config import SGLangConfig
 from nemo_rl.models.generation.sglang.fault_tolerance import RolloutHealthMonitor
-from nemo_rl.models.generation.sglang.sglang_router import RouterActor
+from nemo_rl.models.generation.sglang.sglang_router import _start_router
 from nemo_rl.models.generation.sglang.sglang_worker import SGLangGenerationWorker
 from nemo_rl.models.generation.sglang.utils.async_utils import AsyncLoopThread
-from nemo_rl.models.generation.sglang.utils.http_utils import (
-    HttpClient,
-    init_http_client,
+from nemo_rl.models.generation.sglang.utils.http_utils import HttpClient
+from nemo_rl.models.generation.sglang.utils.ip_port_utils import (
+    _allocate_rollout_engine_addr_and_ports_normal,
 )
 from nemo_rl.models.generation.sglang.utils.ray_utils import (
     NOSET_VISIBLE_DEVICES_ENV_VARS_LIST,
-    Lock,
 )
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 
@@ -72,7 +71,7 @@ class SGLangGeneration(GenerationInterface):
         self.pg_reordered_bundle_indices, self.pg_reordered_gpu_ids = (
             get_reordered_bundle(self.pg)
         )
-        self._http_client = init_http_client(sglang_cfg)
+        self._http_client = HttpClient(sglang_cfg)
 
         # --- Engine topology (formerly ``ServerGroup``) ------------------
         gpus_per_engine = sglang_cfg["sglang_server"]["num_gpus_per_engine"]
@@ -86,6 +85,7 @@ class SGLangGeneration(GenerationInterface):
         self.num_gpus_per_node: int = num_gpus_per_node
         self.all_engines: list = [None] * num_engines
         self.num_new_engines: int = 0
+        # It will be useful for future features which involve pd disaggregation, mixture sglang config setup
         self.rank_offset: int = 0
         self.gpu_offset: int = 0
         self.needs_offload: bool = sglang_cfg["sglang_server"]["needs_offload"]
@@ -98,7 +98,9 @@ class SGLangGeneration(GenerationInterface):
         # Resolved router endpoint is held only on the instance; we don't
         # mutate the caller's config dict. Workers receive these as explicit
         # ``router_ip`` / ``router_port`` kwargs in ``init.remote(...)``.
-        router_ip, router_port, router_actor = _start_router(sglang_cfg)
+        router_ip, router_port, router_actor = _start_router(
+            sglang_cfg.get("sglang_router") or {}
+        )
         self.router_ip: str = router_ip
         self.router_port: int = router_port
         # Only set when ``_start_router`` actually spawned the router (i.e.
@@ -110,8 +112,6 @@ class SGLangGeneration(GenerationInterface):
         init_handles, _ = self._start_engines({})
         if init_handles:
             ray.get(init_handles)
-
-        self.rollout_engine_lock = Lock.options(num_cpus=1, num_gpus=0).remote()
 
         if sglang_cfg["sglang_cfg"].get("use_fault_tolerance"):
             monitor = RolloutHealthMonitor(self, sglang_cfg)
@@ -288,11 +288,10 @@ class SGLangGeneration(GenerationInterface):
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
-    def get_updatable_engines_and_lock(self):
+    def get_updatable_engines(self):
         """Return engines eligible for weight updates."""
         return (
             self.engines,
-            self.rollout_engine_lock,
             self.num_new_engines,
             self.engine_gpu_counts,
             self.engine_gpu_offsets,
@@ -357,7 +356,6 @@ class SGLangGeneration(GenerationInterface):
 
         return (
             self.engines,
-            self.rollout_engine_lock,
             self.num_new_engines,
             self.engine_gpu_counts,
             self.engine_gpu_offsets,
@@ -613,7 +611,7 @@ class SGLangGeneration(GenerationInterface):
             idx: int, sp: dict[str, Any], ids: list[int]
         ):
             async with semaphore:
-                return await generate_one_sample(
+                return await self.generate_one_sample(
                     router_ip,
                     router_port,
                     sp,
@@ -800,7 +798,7 @@ class SGLangGeneration(GenerationInterface):
 
         # batch_size == 1, so no task fan-out / as_completed is needed. Just
         # await the single coroutine directly.
-        _, new_tokens, new_logprobs, is_truncated = await generate_one_sample(
+        _, new_tokens, new_logprobs, is_truncated = await self.generate_one_sample(
             router_ip,
             router_port,
             sampling_params,
@@ -923,168 +921,51 @@ class SGLangGeneration(GenerationInterface):
             )
         return success
 
+    # ---------------------------------------------------------------------------
+    # Generate one sample helper
+    # ---------------------------------------------------------------------------
+    async def generate_one_sample(
+        self,
+        sglang_router_ip,
+        sglang_router_port,
+        sampling_params,
+        input_ids,
+        index: int,
+        http_client: HttpClient | None = None,
+    ):
+        """Generate using traditional SGLang router with token-based workflow."""
+        url = f"http://{sglang_router_ip}:{sglang_router_port}/generate"
 
-# ---------------------------------------------------------------------------
-# Generate one sample helper
-# ---------------------------------------------------------------------------
-async def generate_one_sample(
-    sglang_router_ip,
-    sglang_router_port,
-    sampling_params,
-    input_ids,
-    index: int,
-    http_client: HttpClient | None = None,
-):
-    """Generate using traditional SGLang router with token-based workflow."""
-    url = f"http://{sglang_router_ip}:{sglang_router_port}/generate"
+        # Prepare payload for sglang server
+        payload = {
+            "sampling_params": sampling_params,
+            "return_logprob": True,
+            "input_ids": input_ids,
+        }
 
-    # Prepare payload for sglang server
-    payload = {
-        "sampling_params": sampling_params,
-        "return_logprob": True,
-        "input_ids": input_ids,
-    }
+        owns_client = http_client is None
+        if http_client is None:
+            http_client = HttpClient()
 
-    owns_client = http_client is None
-    if http_client is None:
-        http_client = HttpClient()
+        try:
+            output = await http_client.post(url, payload)
+        finally:
+            if owns_client:
+                await http_client.aclose()
 
-    try:
-        output = await http_client.post(url, payload)
-    finally:
-        if owns_client:
-            await http_client.aclose()
-
-    if "output_token_logprobs" in output["meta_info"]:
-        response_tokens = [
-            item[1] for item in output["meta_info"]["output_token_logprobs"]
-        ]
-        response_log_probs = [
-            item[0] for item in output["meta_info"]["output_token_logprobs"]
-        ]
-    else:
-        response_tokens, response_log_probs = [], []
-
-    # SGLang reports the termination reason under meta_info.finish_reason.type;
-    # "length" means the decoder hit max_new_tokens before EOS.
-    finish_reason = output["meta_info"].get("finish_reason") or {}
-    response_truncated = finish_reason.get("type") == "length"
-
-    return index, response_tokens, response_log_probs, response_truncated
-
-
-# ---------------------------------------------------------------------------
-# Port allocation helpers
-# ---------------------------------------------------------------------------
-def _allocate_rollout_engine_addr_and_ports_normal(
-    *,
-    gpus_per_node: int,
-    sglang_cfg,
-    local_all_engines,
-    rank_offset=0,
-    base_port=15000,
-):
-    # get ports
-    # there are 4 ports we need to allocate
-    # 1. server port
-    # 2. nccl port
-    # 3. dist_init_addr port
-    # 4. other ports for dp_attention, which is of size 4 + dp_size
-
-    sglang_dp_size = sglang_cfg["sglang_cfg"]["dp_size"]
-    num_gpus_per_engine = sglang_cfg["sglang_server"]["num_gpus_per_engine"]
-    num_gpus_per_node = gpus_per_node
-
-    _gpus_per_engine = num_gpus_per_engine
-    num_engines_per_node = max(1, num_gpus_per_node // _gpus_per_engine)
-    addr_and_ports: dict[int, dict] = {}
-
-    # Track per-node port cursors so that different server groups (called
-    # sequentially) never race for the same ports on a given node.
-    node_port_cursor: dict[int, int] = {}
-
-    visited_nodes = set()
-    for rank, engine in local_all_engines:
-        local_rank = rank - rank_offset
-        node_index = local_rank // num_engines_per_node
-        if node_index in visited_nodes:
-            continue
-        visited_nodes.add(node_index)
-        # TODO: currently when restarting engines, we will set port for all engines on this node starting with this rank.
-        # e.g. for 8 gpus, if we are restarting engine on gpu 3, we will set port for engine 3,4,5,6,7 on this node.
-        num_engines_on_this_node = num_engines_per_node - (
-            local_rank % num_engines_per_node
-        )
-
-        def get_addr_and_ports(engine, node_idx):
-            # use small ports to prevent ephemeral port between 32768 and 65536.
-            # also, ray uses port 10002-19999, thus we avoid near-10002 to avoid racing condition
-            start_port = node_port_cursor.get(node_idx, base_port)
-
-            def port(consecutive=1):
-                nonlocal start_port
-                _, port = ray.get(
-                    engine._get_current_node_ip_and_free_port.remote(
-                        start_port=start_port,
-                        consecutive=consecutive,
-                    )
-                )
-                start_port = port + consecutive
-                node_port_cursor[node_idx] = start_port
-                return port
-
-            def addr():
-                addr, _ = ray.get(engine._get_current_node_ip_and_free_port.remote())
-                return addr
-
-            return addr, port
-
-        get_addr, get_port = get_addr_and_ports(engine, node_index)
-
-        for i in range(num_engines_on_this_node):
-            current_rank = rank + i
-            addr_and_ports.setdefault(current_rank, {})
-            addr_and_ports[current_rank]["host"] = get_addr()
-            addr_and_ports[current_rank]["port"] = get_port()
-            addr_and_ports[current_rank]["nccl_port"] = get_port()
-
-        if _gpus_per_engine > num_gpus_per_node:
-            num_node_per_engine = _gpus_per_engine // num_gpus_per_node
-            if local_rank % num_node_per_engine == 0:
-                dist_init_addr = f"{get_addr()}:{get_port(30 + sglang_dp_size)}"
-                for i in range(num_node_per_engine):
-                    addr_and_ports.setdefault(rank + i, {})
-                    addr_and_ports[rank + i]["dist_init_addr"] = dist_init_addr
+        if "output_token_logprobs" in output["meta_info"]:
+            response_tokens = [
+                item[1] for item in output["meta_info"]["output_token_logprobs"]
+            ]
+            response_log_probs = [
+                item[0] for item in output["meta_info"]["output_token_logprobs"]
+            ]
         else:
-            for i in range(num_engines_on_this_node):
-                addr_and_ports[rank + i]["dist_init_addr"] = (
-                    f"{get_addr()}:{get_port(30 + sglang_dp_size)}"
-                )
+            response_tokens, response_log_probs = [], []
 
-    for i, _ in local_all_engines:
-        for key in ["port", "nccl_port", "dist_init_addr"]:
-            assert key in addr_and_ports[i], f"Engine {i} {key} is not set."
-        logger.info(f"Ports for engine {i}: {addr_and_ports[i]}")
+        # SGLang reports the termination reason under meta_info.finish_reason.type;
+        # "length" means the decoder hit max_new_tokens before EOS.
+        finish_reason = output["meta_info"].get("finish_reason") or {}
+        response_truncated = finish_reason.get("type") == "length"
 
-    return addr_and_ports, node_port_cursor
-
-
-def _start_router(
-    sglang_cfg: SGLangConfig,
-) -> tuple[str, int, ray.actor.ActorHandle | None]:
-    """Start sgl router, returning ``(router_ip, router_port, actor_handle)``.
-
-    If ``sglang_router.sglang_router_ip`` is already set, reuse it and return
-    ``actor_handle=None`` (we do not own that router and must not terminate it).
-    Otherwise spawn a ``RouterActor`` in sglang env to own the router process.
-    """
-    router_cfg = sglang_cfg.get("sglang_router") or {}
-    if router_cfg.get("sglang_router_ip") is not None:
-        return router_cfg["sglang_router_ip"], router_cfg["sglang_router_port"], None
-
-    router_actor = RouterActor.options(
-        runtime_env={"py_executable": SGLANG_EXECUTABLE},
-    ).remote()
-    router_ip, router_port = ray.get(router_actor.start.remote(dict(router_cfg)))
-    logger.info(f"Router launched at {router_ip}:{router_port}")
-    return router_ip, router_port, router_actor
+        return index, response_tokens, response_log_probs, response_truncated

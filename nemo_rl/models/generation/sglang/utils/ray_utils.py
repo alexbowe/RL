@@ -1,4 +1,3 @@
-import ipaddress
 import os
 import random
 import socket
@@ -18,41 +17,6 @@ NOSET_VISIBLE_DEVICES_ENV_VARS_LIST = [
     "RAY_EXPERIMENTAL_NOSET_TPU_VISIBLE_CHIPS",
     "RAY_EXPERIMENTAL_NOSET_ONEAPI_DEVICE_SELECTOR",
 ]
-
-
-class RayActor:
-    """Base class for Ray actors providing node IP / free port helpers."""
-
-    @staticmethod
-    def _get_current_node_ip_and_free_port(start_port=10000, consecutive=1):
-        return get_current_node_ip(), get_free_port(
-            start_port=start_port, consecutive=consecutive
-        )
-
-    def get_master_addr_and_port(self):
-        return self.master_addr, self.master_port
-
-
-@ray.remote
-class Lock(RayActor):
-    def __init__(self):
-        self._locked = False  # False: unlocked, True: locked
-
-    def acquire(self):
-        """Try to acquire the lock.
-
-        Returns True if acquired, False otherwise. Caller should retry until
-        it returns True.
-        """
-        if not self._locked:
-            self._locked = True
-            return True
-        return False
-
-    def release(self):
-        """Release the lock, allowing others to acquire."""
-        assert self._locked, "Lock is not acquired, cannot release."
-        self._locked = False
 
 
 def find_available_port(base_port: int):
@@ -159,10 +123,3 @@ def get_free_port(start_port=10000, consecutive=1):
     return port
 
 
-def _wrap_ipv6(host):
-    """Wrap IPv6 address in [] if needed."""
-    try:
-        ipaddress.IPv6Address(host.strip("[]"))
-        return f"[{host.strip('[]')}]"
-    except ipaddress.AddressValueError:
-        return host
