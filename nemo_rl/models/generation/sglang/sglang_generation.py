@@ -145,9 +145,6 @@ class SGLangGeneration(GenerationInterface):
         """
         return ray.get([e.get_base_url.remote() for e in self.rollout_engines])
 
-    # ------------------------------------------------------------------
-    # Engine lifecycle (formerly ``ServerGroup.start_engines`` / ``recover``)
-    # ------------------------------------------------------------------
     def _start_engines(
         self, port_cursors: dict[int, int] | None = None
     ) -> tuple[list, dict[int, int]]:
