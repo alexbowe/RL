@@ -324,6 +324,15 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
             _runtime_is_reward_model,  # Duplicate, already set as _is_reward_model
         ) = runtime_config
 
+        # Rollout topology constant; set once via ``set_rollout_num_gpus_per_engine``
+        # after the SGLang generation handle exists and consumed by
+        # ``stream_weights_via_http`` on each refit.
+        self._rollout_num_gpus_per_engine: Optional[int] = None
+
+    def set_rollout_num_gpus_per_engine(self, num_gpus_per_engine: int) -> None:
+        """Record the rollout engine's TP size for later use in ``stream_weights_via_http``."""
+        self._rollout_num_gpus_per_engine = num_gpus_per_engine
+
     @wrap_with_nvtx_name("dtensor_policy_worker_v2/train")
     def train(
         self,
@@ -912,7 +921,6 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
     def stream_weights_via_http(
         self,
         rollout_engine_urls: list[str],
-        num_gpus_per_engine: int,
         buffer_size_bytes: int = 512 * 1024 * 1024,
     ) -> None:
         """Stream FSDP weights to colocated SGLang engines via CUDA IPC over HTTP.
@@ -922,10 +930,17 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
                 engine's ``node_rank=0`` SGLang HTTP server. The driver
                 resolves these once via ``engine.get_base_url`` and passes
                 them down so every FSDP rank doesn't redo the Ray RPC.
-            num_gpus_per_engine: TP size per SGLang engine. Engine ``i`` is
-                assumed to own global ranks ``[i*K, (i+1)*K)``.
             buffer_size_bytes: Max bucket size in bytes before flushing.
+
+        ``num_gpus_per_engine`` is recorded once via
+        ``set_rollout_num_gpus_per_engine`` after the SGLang generation handle
+        is created, so the caller doesn't have to pass it on every refit.
         """
+        assert self._rollout_num_gpus_per_engine is not None, (
+            "stream_weights_via_http called before set_rollout_num_gpus_per_engine; "
+            "wire the rollout TP size on the policy after SGLangGeneration is built."
+        )
+
         # Manually move model to cuda for cpu offload case
         if self.cpu_offload:
             self.model = self.move_to_cuda(self.model)
@@ -938,7 +953,7 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
         stream_weights_via_http_impl(
             params_generator=dtensor_params_generator(self.model, self.dtype),
             rollout_engine_urls=rollout_engine_urls,
-            num_gpus_per_engine=num_gpus_per_engine,
+            num_gpus_per_engine=self._rollout_num_gpus_per_engine,
             rank=self.rank,
             world_size=torch.distributed.get_world_size(),
             worker_name=str(self),

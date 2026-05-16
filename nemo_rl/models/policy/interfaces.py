@@ -191,17 +191,24 @@ class ColocatablePolicyInterface(PolicyInterface):
     def stream_weights_via_http(
         self,
         rollout_engine_urls: list[str],
-        num_gpus_per_engine: int,
     ) -> list[ray.ObjectRef]:
         """Stream model weights to colocated SGLang engines via CUDA IPC over HTTP.
 
         Args:
             rollout_engine_urls: ``http://host:port`` base URLs of each
                 engine's ``node_rank=0`` SGLang HTTP server.
-            num_gpus_per_engine: TP size per SGLang engine.
+
+        The rollout TP size (``num_gpus_per_engine``) is captured once via
+        ``set_rollout_num_gpus_per_engine`` and reused on every refit.
         """
         raise NotImplementedError(
             "stream_weights_via_http is not implemented for this policy worker"
+        )
+
+    def set_rollout_num_gpus_per_engine(self, num_gpus_per_engine: int) -> None:
+        """Record the rollout engine's TP size for later use in ``stream_weights_via_http``."""
+        raise NotImplementedError(
+            "set_rollout_num_gpus_per_engine is not implemented for this policy worker"
         )
 
     @abstractmethod

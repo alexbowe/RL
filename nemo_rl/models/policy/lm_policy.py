@@ -885,7 +885,6 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
     def stream_weights_via_http(
         self,
         rollout_engine_urls: list[str],
-        num_gpus_per_engine: int,
     ) -> list[ray.ObjectRef]:
         """Send the weights to colocated SGLang engines via CUDA IPC over HTTP.
 
@@ -894,14 +893,24 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 engine's ``node_rank=0`` SGLang HTTP server. The caller
                 resolves these once (via ``engine.get_base_url``) and passes
                 them in, so every FSDP rank doesn't redo the Ray RPC.
-            num_gpus_per_engine: TP size per SGLang engine.
+
+        The rollout TP size is captured once via
+        ``set_rollout_num_gpus_per_engine`` and reused by each worker.
         """
         futures = self.worker_group.run_all_workers_single_data(
             "stream_weights_via_http",
             rollout_engine_urls=rollout_engine_urls,
-            num_gpus_per_engine=num_gpus_per_engine,
         )
         return futures
+
+    def set_rollout_num_gpus_per_engine(self, num_gpus_per_engine: int) -> None:
+        """Broadcast the rollout engine TP size to every policy worker."""
+        ray.get(
+            self.worker_group.run_all_workers_single_data(
+                "set_rollout_num_gpus_per_engine",
+                num_gpus_per_engine=num_gpus_per_engine,
+            )
+        )
 
     def broadcast_weights_for_collective(
         self, kv_scales: Optional[dict[str, float]] = None

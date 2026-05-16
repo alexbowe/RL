@@ -20,8 +20,8 @@ from nemo_rl.models.generation.interfaces import GenerationConfig
 class SglangSpecificArgs(TypedDict):
     """SGLang-specific configuration arguments.
 
-    Most fields below map directly to SGLang's ServerArgs (see
-    `sglang.srt.server_args.ServerArgs`).
+    Most fields below map directly to SGLang's ServerArgs 
+    Please Check: https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/server_args.py
     """
 
     # Path to model weights (local folder or HF repo id).

@@ -120,10 +120,6 @@ class SGLangGeneration(GenerationInterface):
     @property
     def engines(self) -> list:
         """Node-0 engines only (one entry per logical engine).
-
-        For multi-node TP, ``all_engines`` contains ``nodes_per_engine``
-        consecutive actors per logical engine; this slice returns just the
-        node-0 representative for each.
         """
         return self.all_engines[:: self.nodes_per_engine]
 
@@ -143,6 +139,11 @@ class SGLangGeneration(GenerationInterface):
             self.gpu_offset + j * self.num_gpus_per_engine
             for j in range(len(self.engines))
         ]
+
+    def get_rollout_engine_urls(self) -> list[str]:
+        """Resolve node-0 engine HTTP base URLs once on the driver.
+        """
+        return ray.get([e.get_base_url.remote() for e in self.rollout_engines])
 
     # ------------------------------------------------------------------
     # Engine lifecycle (formerly ``ServerGroup.start_engines`` / ``recover``)

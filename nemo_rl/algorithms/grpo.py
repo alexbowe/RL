@@ -716,6 +716,9 @@ def setup(
             worker_init_timing_metrics=worker_init_timing_metrics,
         )
 
+        # Capture rollout TP size on the policy once; refit calls no longer need it.
+        policy.set_rollout_num_gpus_per_engine(policy_generation.num_gpus_per_engine)
+
         print(
             f"  ✓ Using SGLang backend for generation with {policy_config['model_name']}",
             flush=True,
@@ -1144,15 +1147,8 @@ def refit_policy_generation(
 
             if isinstance(policy_generation, SGLangGeneration):
                 # Stream weights to colocated SGLang engines via CUDA IPC over HTTP.
-                # Engine-i owns global ranks [i*K, (i+1)*K) where K = num_gpus_per_engine.
-                # Resolve node-0 engine HTTP URLs once on the driver so every
-                # FSDP rank doesn't redo the Ray RPC.
-                rollout_engine_urls = ray.get(
-                    [e.get_base_url.remote() for e in policy_generation.rollout_engines]
-                )
                 futures_train = policy.stream_weights_via_http(
-                    rollout_engine_urls=rollout_engine_urls,
-                    num_gpus_per_engine=policy_generation.num_gpus_per_engine,
+                    rollout_engine_urls=policy_generation.get_rollout_engine_urls(),
                 )
                 # Wait for all workers to complete
                 ray.get(futures_train)
