@@ -693,7 +693,7 @@ def parse_sglang_args():
     return args, overrides
 
 
-def run_sglang_weight_check_flow():
+def main_sglang():
     """Load the GRPO YAML config and run the SGLang weight-equality check.
 
     Mirrors run_grpo.py's config-loading pipeline and grpo.setup's colocated
@@ -791,13 +791,8 @@ def _is_sglang_mode() -> bool:
     return False
 
 
-def main():
-    """Main execution function."""
-    if _is_sglang_mode():
-        run_sglang_weight_check_flow()
-        print("Script completed successfully!")
-        return
-
+def main_vllm():
+    """vLLM weight-check flow."""
     # Parse command line arguments
     args = parse_args()
 
@@ -844,6 +839,13 @@ def main():
     # Cleanup
     cleanup_resources(vllm_inference_policy)
 
+
+def main():
+    """Dispatch to the sglang or vllm weight-check flow."""
+    if _is_sglang_mode():
+        main_sglang()
+    else:
+        main_vllm()
     print("Script completed successfully!")
 
 
