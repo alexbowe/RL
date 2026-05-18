@@ -335,6 +335,39 @@ jobs:
           docker rmi "${SRC}" "${DST}" 2>/dev/null || true
           rm -rf /tmp/uv-cache /tmp/Dockerfile.uv-cache
 
+  seed-azure-cache:
+    name: Seed Azure container cache
+    needs: [build-container, org-member-pre-flight]
+    if: >-
+      ${{
+        github.ref == 'refs/heads/main' &&
+        needs.build-container.result == 'success'
+      }}
+    runs-on: ${{ format('{0}-gpu-x2', needs.org-member-pre-flight.outputs.runner_prefix) }}
+    environment: nemo-ci
+    steps:
+      - name: Install Azure CLI
+        run: curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Azure ACR Login
+        run: az acr login --name nemoci
+
+      - name: Copy main image to Azure registry
+        env:
+          SRC: ${{ needs.org-member-pre-flight.outputs.registry }}/${{ vars.CI_CONTAINER_NAME }}:main
+          DST: ${{ vars.NON_NVIDIA_CONTAINER_REGISTRY }}/${{ vars.CI_CONTAINER_NAME }}:main
+        run: |
+          set -euo pipefail
+          docker pull "${SRC}"
+          docker tag "${SRC}" "${DST}"
+          docker push "${DST}"
+          docker rmi "${SRC}" "${DST}" 2>/dev/null || true
+
   cicd-doc-tests:
     strategy:
       fail-fast: false
