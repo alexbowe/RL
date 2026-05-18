@@ -479,6 +479,9 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
             model_config=engine_client.model_config,
             renderer=engine_client.renderer,
             model_registry=openai_serving_models.registry,
+            request_logger=None,
+            chat_template=None,
+            chat_template_content_format="auto",
         )
 
         serving_chat_default_kwargs = dict(
