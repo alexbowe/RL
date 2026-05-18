@@ -25,7 +25,7 @@ from megatron.core.parallel_state import (
 from megatron.core.utils import StragglerDetector
 from megatron.training.utils import get_ltor_masks_and_position_ids
 
-from nemo_rl.algorithms.interfaces import LossFunction, LossType
+from nemo_rl.algorithms.loss.interfaces import LossFunction, LossType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import _get_tokens_on_this_cp_rank
 from nemo_rl.models.megatron.common import _round_up_to_multiple
@@ -175,6 +175,7 @@ def get_microbatch_iterator(
             pad_full_seq_to,
         ) = _get_pack_sequence_parameters_for_megatron(
             cfg["megatron_cfg"],
+            cfg["make_sequence_length_divisible_by"],
             pack_seq_dim_size,
         )
         micro_batch_size = 1
@@ -529,12 +530,14 @@ def _pack_sequences_for_megatron(
 
 def _get_pack_sequence_parameters_for_megatron(
     megatron_cfg: dict,
+    pad_individual_seqs_to_multiple_of: int,
     max_seq_len_in_batch: int,
 ):
     """Get pack sequence parameters for Megatron model processing with optional context parallelism.
 
     Args:
         megatron_cfg: Megatron configuration
+        pad_individual_seqs_to_multiple_of: Pad individual sequences to a multiple of this value
         max_seq_len_in_batch: Maximum sequence length in batch
 
     Returns:
@@ -551,19 +554,41 @@ def _get_pack_sequence_parameters_for_megatron(
     use_fp8 = fp8_cfg.get("enabled", False)
 
     # individual sequence needs to be splitted to CP domain, and to TP domain when SP is enabled.
-    pad_individual_seqs_to_multiple_of = 1
+    minimum_pad_factor = 1
     if cp_size > 1:
-        pad_individual_seqs_to_multiple_of *= cp_size * 2
+        minimum_pad_factor *= cp_size * 2
     if tp_size > 1 and sp:
-        pad_individual_seqs_to_multiple_of *= tp_size
+        minimum_pad_factor *= tp_size
+    assert pad_individual_seqs_to_multiple_of % minimum_pad_factor == 0, (
+        f"make_sequence_length_divisible_by ({pad_individual_seqs_to_multiple_of}) is not a multiple of minimum_pad_factor ({minimum_pad_factor}).\n"
+        f"Please set policy.make_sequence_length_divisible_by to a multiple of {minimum_pad_factor}.\n"
+        f"    - If CP is enabled, the minimum pad factor is `cp_size * 2`.\n"
+        f"    - If TP+SP is enabled, the minimum pad factor is `tp_size`.\n"
+        f"    - If both are enabled, the minimum pad factor is `cp_size * 2 * tp_size`."
+    )
 
-    # packed sequence length, after splitted to TP and CP domains, needs to be divisible by 128 if using blockwise FP8, and divisible by 16 if using other FP8 recipes.
+    # packed sequence length, after sharding to TP and CP domains, needs to be divisible
+    # by a recipe-dependent divisor:
+    #   blockwise FP8 : 128  (cublas block size)
+    #   MXFP8         :  32  (MXFP8 block size)
+    #   other FP8     :  16
+    #   HybridEP+flex : 128  (MAX_NUM_OF_TOKENS_PER_RANK must be divisible by
+    #                         NUM_OF_TOKENS_PER_CHUNK=128 in deep_ep JIT kernels)
+    # When multiple constraints apply, take the max (128 is a multiple of 32/16).
+    divisor = 1
     if use_fp8:
-        divisor = 16
         if fp8_cfg["fp8_recipe"] == "blockwise":
-            divisor = 128
+            divisor = max(divisor, 128)
         elif fp8_cfg["fp8_recipe"] == "mxfp8":
-            divisor = 32
+            divisor = max(divisor, 32)
+        else:
+            divisor = max(divisor, 16)
+    if (
+        megatron_cfg.get("moe_token_dispatcher_type") == "flex"
+        and megatron_cfg.get("moe_flex_dispatcher_backend") == "hybridep"
+    ):
+        divisor = max(divisor, 128)
+    if divisor > 1:
         pad_packed_seq_to_multiple_of = divisor
         if cp_size > 1:
             pad_packed_seq_to_multiple_of *= cp_size * 2

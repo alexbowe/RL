@@ -16,6 +16,7 @@
 
 This module provides different advantage estimation strategies:
 - GRPOAdvantageEstimator: Standard GRPO advantage with leave-one-out baseline
+- GDPOAdvantageEstimator: Multi-reward GDPO (per-component baselines, sum then normalize)
 - ReinforcePlusPlusAdvantageEstimator: Reinforce++ with optional baseline subtraction (minus_baseline) and KL penalty in reward
 Reference papers:
 - ProRLv2: https://developer.nvidia.com/blog/scaling-llm-reinforcement-learning-with-prolonged-training-using-prorl-v2/
@@ -24,7 +25,12 @@ Reference papers:
 
 import torch
 
-from nemo_rl.algorithms.utils import calculate_baseline_and_std_per_prompt, calculate_kl
+from nemo_rl.algorithms.loss import ClippedPGLossConfig
+from nemo_rl.algorithms.utils import (
+    calculate_baseline_and_std_per_prompt,
+    calculate_kl,
+    get_gdpo_reward_component_keys,
+)
 
 
 class GRPOAdvantageEstimator:
@@ -33,7 +39,7 @@ class GRPOAdvantageEstimator:
     Note: GRPO computes advantages over all responses for each prompt.
     """
 
-    def __init__(self, estimator_config: dict, loss_config: dict):
+    def __init__(self, estimator_config: dict, loss_config: ClippedPGLossConfig):
         self.use_leave_one_out_baseline = estimator_config["use_leave_one_out_baseline"]
         self.normalize_rewards = estimator_config["normalize_rewards"]
 
@@ -69,6 +75,79 @@ class GRPOAdvantageEstimator:
         return advantages.expand(mask.shape)
 
 
+class GDPOAdvantageEstimator:
+    """GDPO-style advantage estimator with leave-one-out baseline.
+
+    Note: GDPO computes advantages for each reward separately over all responses for each prompt.
+    """
+
+    def __init__(self, estimator_config: dict, loss_config: ClippedPGLossConfig):
+        self.use_leave_one_out_baseline = estimator_config["use_leave_one_out_baseline"]
+        self.normalize_rewards = estimator_config["normalize_rewards"]
+
+    def compute_advantage(
+        self,
+        prompt_ids,
+        rewards,
+        mask,
+        repeated_batch,
+        **kwargs,
+    ):
+        """Compute GDPO advantages.
+
+        Args:
+            prompt_ids: Tensor identifying which prompt each sample belongs to (for per-prompt baselines).
+            rewards: Unused; for interface consistency.
+            repeated_batch: Batch containing reward1, reward2, ... keys.
+            mask: Response token mask of shape [batch_size, seq_len], 1 for valid response tokens, 0 for padding.
+            **kwargs: Additional arguments (unused).
+
+        Returns:
+            Advantages tensor of shape [batch_size, seq_len].
+        """
+        reward_component_keys = get_gdpo_reward_component_keys(repeated_batch)
+        if len(reward_component_keys) < 2:
+            raise ValueError(
+                f"GDPO requires multiple reward components (reward1, reward2, ...). "
+                f"This batch has {len(reward_component_keys)} component(s). "
+                "Switch to GRPO by setting grpo.adv_estimator.name to 'grpo' in your config."
+            )
+        valid = torch.ones_like(repeated_batch[reward_component_keys[0]])
+        leave_one_out = self.use_leave_one_out_baseline
+        assert prompt_ids.shape[0] == valid.shape[0], (
+            "prompt_ids must match reward batch size; "
+            f"got {prompt_ids.shape[0]} vs {valid.shape[0]}"
+        )
+        advantage_parts = []
+        for key in reward_component_keys:
+            r = repeated_batch[key]
+            base, std_k = calculate_baseline_and_std_per_prompt(
+                prompt_ids,
+                r,
+                valid,
+                leave_one_out_baseline=leave_one_out,
+            )
+            adv_k = (r - base).unsqueeze(-1)
+            if self.normalize_rewards:
+                epsilon = 1e-6
+                non_zero_std_mask = std_k > 0
+                adv_k[non_zero_std_mask] = adv_k[non_zero_std_mask] / (
+                    std_k.unsqueeze(-1)[non_zero_std_mask] + epsilon
+                )
+
+            advantage_parts.append(adv_k)
+
+        advantages = sum(advantage_parts)
+        # Normalize combined advantage to zero mean and unit std
+        adv_std = advantages.std()
+        if adv_std > 0:
+            advantages = (advantages - advantages.mean()) / adv_std
+        else:
+            advantages = advantages - advantages.mean()
+
+        return advantages.expand(mask.shape)
+
+
 class ReinforcePlusPlusAdvantageEstimator:
     """Reinforce++ advantage estimator with optional baseline subtraction and KL penalty in reward.
 
@@ -77,11 +156,11 @@ class ReinforcePlusPlusAdvantageEstimator:
         use_kl_in_reward: If True, add KL penalty to reward instead of loss.
     """
 
-    def __init__(self, estimator_config: dict, loss_config: dict):
+    def __init__(self, estimator_config: dict, loss_config: ClippedPGLossConfig):
         self.minus_baseline = estimator_config["minus_baseline"]
-        self.use_kl_in_reward = loss_config["use_kl_in_reward"]
-        self.kl_coef = loss_config["reference_policy_kl_penalty"]
-        self.kl_type = loss_config["reference_policy_kl_type"]
+        self.use_kl_in_reward = loss_config.use_kl_in_reward
+        self.kl_coef = loss_config.reference_policy_kl_penalty
+        self.kl_type = loss_config.reference_policy_kl_type
 
     def compute_advantage(
         self,

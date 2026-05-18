@@ -24,13 +24,48 @@ import re
 import shutil
 import warnings
 from pathlib import Path
-from typing import Any, Mapping, NotRequired, Optional, TypedDict, Union
+from typing import Any, Literal, Mapping, NotRequired, Optional, TypedDict, Union
 
 import numpy as np
 import torch
 import yaml
+from pydantic import BaseModel
 
 PathLike = Union[str, "os.PathLike[Any]"]
+
+
+class PretrainedCheckpointConfig(TypedDict):
+    """Configuration for restoring initial weights from a pre-existing Megatron checkpoint.
+
+    When set, the policy will restore its initial weights from this checkpoint
+    instead of loading them from ``model_name``. Supported by the Megatron backend
+    only; DTensor backends continue to use HuggingFace weights via ``model_name``.
+
+    Attributes:
+        path: Filesystem path to the checkpoint to load.
+
+            * For ``"megatron_bridge"`` format: may be either a **specific
+              iteration directory** that contains a ``run_config.yaml`` file
+              (e.g. ``/checkpoints/iter_0005000/``) or a **checkpoint root
+              directory** that contains ``iter_*`` subdirectories.  When a
+              root directory is given the latest ``iter_*`` subdirectory is
+              used automatically.
+            * For ``"megatron_lm"`` format: may be the checkpoint root directory
+              (containing ``iter_*`` subdirectories and a
+              ``latest_checkpointed_iteration.txt`` tracker file) or a specific
+              iteration directory (e.g. ``/mlm_checkpoints/iter_0005000/``).
+              The checkpoint must use the ``torch_dist`` format (i.e. contain a
+              ``metadata.json`` file); the legacy ``torch`` format is not
+              supported.
+
+        format: Checkpoint format.  Use ``"megatron_bridge"`` for checkpoints
+            saved by megatron-bridge (e.g. produced by a prior NeMo-RL run) and
+            ``"megatron_lm"`` for checkpoints saved by upstream Megatron-LM.
+
+    """
+
+    path: str
+    format: Literal["megatron_bridge", "megatron_lm"]
 
 
 class CheckpointingConfig(TypedDict):
@@ -49,6 +84,7 @@ class CheckpointingConfig(TypedDict):
     model_cache_dir (str): Directory for model cache (for safetensors format).
     model_repo_id (str): Repository ID for the model (for safetensors format).
     is_peft (bool): Whether the model uses PEFT.
+    save_optimizer (bool): Whether to save optimizer state with checkpoints.
     """
 
     enabled: bool
@@ -58,6 +94,8 @@ class CheckpointingConfig(TypedDict):
     save_period: int
     keep_top_k: NotRequired[int]
     checkpoint_must_save_by: NotRequired[str | None]
+    pretrained_checkpoint: NotRequired[PretrainedCheckpointConfig]
+    save_optimizer: NotRequired[bool]  # Default: True
     # New nemo-automodel integration fields
     model_save_format: NotRequired[str | None]  # Default: "safetensors"
     save_consolidated: NotRequired[bool]  # Default: False
@@ -65,6 +103,7 @@ class CheckpointingConfig(TypedDict):
     model_repo_id: NotRequired[str]  # Default: ""
     is_peft: NotRequired[bool]  # Default: False
     peft_config: NotRequired[Any]  # Default: None
+    is_async: NotRequired[bool]  # Default: False
 
 
 class CheckpointManager:
@@ -98,6 +137,7 @@ class CheckpointManager:
         self.metric_name: str | None = config["metric_name"]
         self.higher_is_better = config["higher_is_better"]
         self.keep_top_k = config["keep_top_k"]
+        self.save_optimizer = config["save_optimizer"]
 
         # Store nemo-automodel specific config options
         self.model_save_format = config.get("model_save_format", "safetensors")
@@ -106,11 +146,52 @@ class CheckpointManager:
         self.model_repo_id = config.get("model_repo_id", "")
         self.is_peft = config.get("is_peft", False)
 
+    @staticmethod
+    def get_resume_paths(
+        last_checkpoint_path: Optional[PathLike],
+    ) -> tuple[Optional[Path], Optional[Path]]:
+        """Get weights and optimizer paths for resuming from a checkpoint.
+
+        Args:
+            last_checkpoint_path: Path to the last checkpoint, or None if starting fresh.
+
+        Returns:
+            Tuple of (weights_path, optimizer_path). Both are None if no checkpoint.
+            optimizer_path is None if checkpoint exists but optimizer state was not saved.
+        """
+        if last_checkpoint_path:
+            weights_path = Path(last_checkpoint_path) / "policy" / "weights"
+            optimizer_path = Path(last_checkpoint_path) / "policy" / "optimizer"
+
+            # DTensor path
+            if optimizer_path.exists():
+                return weights_path, optimizer_path
+
+            # Megatron path
+            common_pt_path = weights_path / "iter_0000000" / "common.pt"
+            if common_pt_path.exists():
+                common_pt_obj = torch.load(common_pt_path, map_location="cpu")
+                if "optimizer" in common_pt_obj:
+                    # In Megatron, optimizer_path is only a flag to indicate that the optimizer
+                    # state is embedded in the weights_path. We will actually load the optimizer
+                    # state from the weights_path.
+                    return weights_path, optimizer_path
+
+            warnings.warn(
+                f"Optimizer state not found at {optimizer_path} (DTensor path), and no embedded "
+                f"optimizer state detected under {weights_path} (Megatron path). "
+                "Optimizer will be freshly initialized.",
+                stacklevel=2,
+            )
+            optimizer_path = None
+            return weights_path, optimizer_path
+        return None, None
+
     def init_tmp_checkpoint(
         self,
         step: int,
         training_info: Mapping[str, Any],
-        run_config: Optional[Mapping[str, Any]] = None,
+        run_config: Optional[BaseModel] = None,
     ) -> PathLike:
         """Initialize a temporary checkpoint directory.
 
@@ -123,7 +204,7 @@ class CheckpointManager:
         Args:
             step (int): The training step number.
             training_info (dict[str, Any]): Dictionary containing training metrics and info.
-            run_config (Optional[dict[str, Any]]): Optional configuration for the training run.
+            run_config (Optional[BaseModel]): Optional configuration for the training run.
 
         Returns:
             PathLike: Path to the temporary checkpoint directory.
@@ -144,7 +225,7 @@ class CheckpointManager:
         # save config
         if run_config is not None:
             with open(save_dir / "config.yaml", "w") as f:
-                yaml.safe_dump(run_config, f)
+                yaml.safe_dump(run_config.model_dump(), f)
 
         return Path(os.path.abspath(save_dir))
 

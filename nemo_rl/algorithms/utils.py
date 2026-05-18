@@ -14,6 +14,7 @@
 
 import math
 import random
+import re
 import warnings
 from functools import partial, wraps
 from typing import Any, Optional
@@ -29,6 +30,12 @@ from transformers import (
 from nemo_rl.data.chat_templates import COMMON_CHAT_TEMPLATES
 from nemo_rl.models.policy import TokenizerConfig
 from nemo_rl.utils.logger import Logger
+
+
+def get_gdpo_reward_component_keys(batch) -> list:
+    """Return batch keys that are reward components (reward1, reward2, ...) in sorted order."""
+    keys = [k for k in batch.keys() if re.match(r"reward\d+$", str(k))]
+    return sorted(keys, key=lambda k: int(re.search(r"\d+", str(k)).group()))
 
 
 def calculate_kl(
@@ -182,6 +189,39 @@ def masked_mean(
     return torch.sum(values * mask, dim=dim) / (normalization_factor + 1e-8)
 
 
+def mask_out_neg_inf_logprobs(
+    logprobs: torch.Tensor, mask: torch.Tensor, logprobs_name: str
+) -> torch.Tensor:
+    """Mask out negative infinity log probabilities.
+
+    Handling sampling mask mismatch:
+    vLLM samples token X from top-k/p filtered distribution -> generation_logprobs[X] is always finite (e.g., -5.41)
+    during training: policy computes logprobs with same top-k/p settings, but the distribution can be slightly different
+    token X may fall outside the training policy's top-k/p set -> curr_logprobs[X] = -inf, prev_logprobs[X] = -inf
+    Detect positions with -inf in any logprobs (generation_logprobs is always finite for valid tokens)
+
+    Args:
+        logprobs: Log probabilities.
+        mask: Mask.
+        logprobs_name: Name of the logprobs tensor. Used for printing warning messages.
+
+    Returns:
+        Masked log probabilities.
+    """
+    is_neginf = torch.isinf(logprobs)
+    neginf_count = (is_neginf & mask.bool()).sum().item()
+    if neginf_count > 0:
+        print(
+            f"[WARNING]: {neginf_count}/{int(mask.sum().item())} valid tokens have -inf in {logprobs_name} "
+            "(policy top-k/top-p mismatch). Masking out these positions."
+        )
+
+    mask = mask * (~is_neginf).float()
+    logprobs = torch.where(mask.bool(), logprobs, 0.0)
+
+    return logprobs
+
+
 def set_seed(seed: int) -> None:
     """Sets the seed for python, numpy, and pytorch."""
     random.seed(seed)
@@ -320,6 +360,45 @@ def get_tokenizer(
         processor.bos_token_id = tokenizer.bos_token_id
         # copy name_or_path from tokenizer to processor for logging
         processor.name_or_path = tokenizer.name_or_path
+        # copy chat_template so processor.apply_chat_template() works for
+        # models whose processor doesn't ship its own template (e.g. Qwen3.5)
+        if not getattr(processor, "chat_template", None) and getattr(
+            tokenizer, "chat_template", None
+        ):
+            processor.chat_template = tokenizer.chat_template
+        if hasattr(processor, "feature_extractor") and "audio" in tokenizer_config:
+            if (
+                "sampling_rate" in tokenizer_config["audio"]
+                and tokenizer_config["audio"]["sampling_rate"]
+                != processor.feature_extractor.sampling_rate
+            ):
+                new_sampling_rate = tokenizer_config["audio"]["sampling_rate"]
+                warnings.warn(
+                    f"Overriding audio sampling rate from {processor.feature_extractor.sampling_rate} to {new_sampling_rate}"
+                )
+                processor.feature_extractor.sampling_rate = new_sampling_rate
+        if hasattr(processor, "video_processor") and "video" in tokenizer_config:
+            if (
+                "fps" in tokenizer_config["video"]
+                and tokenizer_config["video"]["fps"] != processor.video_processor.fps
+            ):
+                # override the video loading fps
+                new_fps = tokenizer_config["video"]["fps"]
+                warnings.warn(
+                    f"Overriding video fps from {processor.video_processor.fps} to {new_fps}"
+                )
+                processor.video_processor.fps = new_fps
+            # fps and num_frames cannot co-exist, but let it crash later
+            if (
+                "num_frames" in tokenizer_config["video"]
+                and tokenizer_config["video"]["num_frames"]
+                != processor.video_processor.num_frames
+            ):
+                new_num_frames = tokenizer_config["video"]["num_frames"]
+                warnings.warn(
+                    f"Overriding video num_frames from {processor.video_processor.num_frames} to {new_num_frames}"
+                )
+                processor.video_processor.num_frames = new_num_frames
 
     return tokenizer if processor is None else processor
 
@@ -515,9 +594,9 @@ def print_performance_metrics(
             else:
                 print(f"    - Generation Worker {dp_idx:3.0f}: {''.join(timeline)}")
 
-    is_vllm_metrics_logger_enabled = master_config["policy"]["generation"].get(
+    is_vllm_metrics_logger_enabled = master_config.policy["generation"].get(
         "vllm_cfg", {}
-    ).get("enable_vllm_metrics_logger", False) and master_config["policy"][
+    ).get("enable_vllm_metrics_logger", False) and master_config.policy[
         "generation"
     ].get("vllm_cfg", {}).get("async_engine", False)
     generation_logger_metrics = metrics.get("generation_logger_metrics", {})
@@ -539,9 +618,9 @@ def print_performance_metrics(
             "num_pending_samples must be a dictionary"
         )
 
-        vllm_metrics_logger_interval = master_config["policy"]["generation"][
-            "vllm_cfg"
-        ]["vllm_metrics_logger_interval"]
+        vllm_metrics_logger_interval = master_config.policy["generation"]["vllm_cfg"][
+            "vllm_metrics_logger_interval"
+        ]
         print("  • vLLM Logger Metrics:")
         # Visualize the inflight batch sizes timeline
         if len(vllm_logger_metrics["inflight_batch_sizes"].values()) > 0:
@@ -587,14 +666,15 @@ def print_performance_metrics(
             + timing_metrics["policy_training"]
         )
 
-    num_nodes = master_config["cluster"]["num_nodes"]
-    gpus_per_node = master_config["cluster"]["gpus_per_node"]
+    num_nodes = master_config.cluster["num_nodes"]
+    gpus_per_node = master_config.cluster["gpus_per_node"]
     total_num_gpus = num_nodes * gpus_per_node
-    colocated_inference = master_config["policy"]["generation"]["colocated"]["enabled"]
+    colocated_inference = master_config.policy["generation"]["colocated"]["enabled"]
 
     # Idle Time from Training Worker (Async GRPO only)
+    grpo_config = master_config.grpo
     if (
-        "async_grpo" in master_config and master_config["async_grpo"]["enabled"]
+        "async_grpo" in grpo_config and grpo_config["async_grpo"]["enabled"]
     ) and not colocated_inference:
         # async grpo
         exposed_generation_time = timing_metrics["exposed_generation"]
@@ -617,8 +697,7 @@ def print_performance_metrics(
         )
 
     number_of_samples_per_step = (
-        master_config["grpo"]["num_prompts_per_step"]
-        * master_config["grpo"]["num_generations_per_prompt"]
+        grpo_config["num_prompts_per_step"] * grpo_config["num_generations_per_prompt"]
     )
 
     if colocated_inference:
@@ -626,11 +705,11 @@ def print_performance_metrics(
         generation_num_gpus = total_num_gpus
     else:
         generation_num_nodes = (
-            master_config["policy"]["generation"]["colocated"]["resources"]["num_nodes"]
+            master_config.policy["generation"]["colocated"]["resources"]["num_nodes"]
             or 1
         )
         generation_num_gpus = (
-            master_config["policy"]["generation"]["colocated"]["resources"][
+            master_config.policy["generation"]["colocated"]["resources"][
                 "gpus_per_node"
             ]
             * generation_num_nodes
