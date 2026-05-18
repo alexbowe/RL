@@ -30,6 +30,29 @@ from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.utils import create_env
 
 
+def get_train_dataset_name(data_config: DataConfig) -> Optional[str]:
+    """Return the training ``dataset_name`` from a data config.
+
+    The shape of ``data_config["train"]`` is not consistent across algorithms
+    at the point where checkpoint save/load happens:
+    - ``setup_response_data`` (used by GRPO/Distillation) and ``setup_data``
+      in ``run_sft.py`` normalize a single-dataset dict into ``[dict]``.
+    - ``setup_preference_data`` (used by DPO/RM) leaves it as a ``dict``.
+
+    This helper tolerates both shapes and returns ``None`` when the dataset
+    name cannot be determined (e.g. legacy checkpoints with no name written,
+    multi-dataset training, or malformed configs).
+    """
+    if not data_config:
+        return None
+    train = data_config.get("train")
+    if isinstance(train, list):
+        train = train[0] if train else None
+    if isinstance(train, dict):
+        return train.get("dataset_name")
+    return None
+
+
 # TODO: @yukih: unify to setup_data after dataset refactored
 def setup_response_data(
     tokenizer: AutoProcessor | AutoTokenizer,

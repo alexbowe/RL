@@ -38,6 +38,7 @@ from nemo_rl.data.llm_message_utils import (
     batched_message_log_to_flat_message,
     get_keys_from_message_log,
 )
+from nemo_rl.data.utils import get_train_dataset_name
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import (
     ClusterConfig,
@@ -253,10 +254,24 @@ def setup(
     )
 
     if last_checkpoint_path:
-        dataloader_state_dict = torch.load(
-            os.path.join(last_checkpoint_path, "train_dataloader.pt")
-        )
-        dataloader.load_state_dict(dataloader_state_dict)
+        saved = torch.load(os.path.join(last_checkpoint_path, "train_dataloader.pt"))
+        if isinstance(saved, dict) and "dataset_name" in saved:
+            saved_name = saved["dataset_name"]
+            current_name = get_train_dataset_name(data_config)
+            if (
+                saved_name is not None
+                and current_name is not None
+                and saved_name != current_name
+            ):
+                print(
+                    f"  ⚠ Dataset swap detected: was {saved_name!r}, now {current_name!r}. "
+                    f"Skipping dataloader state restore; new dataset starts from index 0.",
+                    flush=True,
+                )
+            else:
+                dataloader.load_state_dict(saved["state"])
+        else:
+            dataloader.load_state_dict(saved)
 
     print(
         f"  ✓ Training dataloader loaded with {len(train_dataset)} samples", flush=True
@@ -857,7 +872,12 @@ def distillation_train(
                             checkpointing_cfg=master_config.checkpointing,
                         )
                         torch.save(
-                            dataloader.state_dict(),
+                            {
+                                "state": dataloader.state_dict(),
+                                "dataset_name": get_train_dataset_name(
+                                    master_config.data
+                                ),
+                            },
                             os.path.join(checkpoint_path, "train_dataloader.pt"),
                         )
                         checkpointer.finalize_checkpoint(checkpoint_path)

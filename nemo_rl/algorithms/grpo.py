@@ -58,7 +58,7 @@ from nemo_rl.data.llm_message_utils import (
     batched_message_log_to_flat_message,
     get_keys_from_message_log,
 )
-from nemo_rl.data.utils import extract_necessary_env_names
+from nemo_rl.data.utils import extract_necessary_env_names, get_train_dataset_name
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.ray_actor_environment_registry import get_actor_python_env
 from nemo_rl.distributed.virtual_cluster import ClusterConfig, RayVirtualCluster
@@ -319,10 +319,26 @@ def setup(
             num_workers=data_config["num_workers"],
         )
         if last_checkpoint_path is not None:
-            dataloader_state_dict = torch.load(
+            saved = torch.load(
                 os.path.join(last_checkpoint_path, f"train_dataloader{suffix}.pt")
             )
-            dataloader.load_state_dict(dataloader_state_dict)
+            if isinstance(saved, dict) and "dataset_name" in saved:
+                saved_name = saved["dataset_name"]
+                current_name = get_train_dataset_name(data_config)
+                if (
+                    saved_name is not None
+                    and current_name is not None
+                    and saved_name != current_name
+                ):
+                    print(
+                        f"  ⚠ Dataset swap detected: was {saved_name!r}, now {current_name!r}. "
+                        f"Skipping dataloader state restore; new dataset starts from index 0.",
+                        flush=True,
+                    )
+                else:
+                    dataloader.load_state_dict(saved["state"])
+            else:
+                dataloader.load_state_dict(saved)
         return dataloader
 
     if data_config["use_multiple_dataloader"]:
@@ -2088,7 +2104,12 @@ def grpo_train(
                                 )
                         else:
                             torch.save(
-                                wrapped_dataloader.state_dict(),
+                                {
+                                    "state": wrapped_dataloader.state_dict(),
+                                    "dataset_name": get_train_dataset_name(
+                                        master_config.data
+                                    ),
+                                },
                                 os.path.join(checkpoint_path, "train_dataloader.pt"),
                             )
                         checkpointer.finalize_checkpoint(checkpoint_path)
@@ -3154,7 +3175,12 @@ def async_grpo_train(
                             trajectory_collector.get_dataloader_state.remote()
                         )
                         torch.save(
-                            actual_dataloader_state,
+                            {
+                                "state": actual_dataloader_state,
+                                "dataset_name": get_train_dataset_name(
+                                    master_config.data
+                                ),
+                            },
                             os.path.join(checkpoint_path, "train_dataloader.pt"),
                         )
                         checkpointer.finalize_checkpoint(checkpoint_path)
