@@ -1104,7 +1104,7 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
 
         # Reset the prefix cache to ensure that prefix cache is not reused after weights are updated
         await self.llm.reset_prefix_cache()
-        await self.llm.sleep(level=1)
+        await self.llm.sleep(level=self._sleep_level())
 
         gc.collect()
         torch.cuda.empty_cache()
