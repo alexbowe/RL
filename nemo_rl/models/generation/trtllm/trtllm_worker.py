@@ -123,6 +123,7 @@ class TrtllmGenerationWorker:
 
         import tensorrt_llm
         from tensorrt_llm import SamplingParams as TrtSamplingParams
+        from tensorrt_llm.llmapi import KvCacheConfig
 
         self.TrtSamplingParams = TrtSamplingParams
 
@@ -164,8 +165,18 @@ class TrtllmGenerationWorker:
             max_seq_len=trtllm_cfg["max_model_len"],
             orchestrator_type="ray",
             ray_worker_extension_cls="nemo_rl.models.generation.trtllm.trtllm_backend.NcclExtension",
+            cuda_graph_config=None,
             trust_remote_code=True,
         )
+        kv_cache_kwargs: dict[str, Any] = {
+            "enable_block_reuse": False,
+            "max_tokens": max_num_tokens,
+        }
+        if "gpu_memory_utilization" in trtllm_cfg:
+            kv_cache_kwargs["free_gpu_memory_fraction"] = trtllm_cfg[
+                "gpu_memory_utilization"
+            ]
+        llm_kwargs["kv_cache_config"] = KvCacheConfig(**kv_cache_kwargs)
         if speculative_config is not None:
             llm_kwargs["speculative_config"] = speculative_config
         if disable_overlap:
@@ -191,9 +202,27 @@ class TrtllmGenerationWorker:
     def shutdown(self) -> bool:
         try:
             self.stop_http_server()
-            if self.llm is not None:
-                del self.llm
-                self.llm = None
+            llm = self.llm
+            self.llm = None
+            if llm is not None:
+                try:
+                    llm.shutdown()
+                except SystemExit as e:
+                    if e.code != 15:
+                        raise
+                except Exception as e:
+                    message = str(e)
+                    if "placement group was removed" in message or "actor died" in message:
+                        pass
+                    else:
+                        print(f"Error during TRT-LLM shutdown: {e}")
+                        return False
+                finally:
+                    if hasattr(llm, "_executor"):
+                        llm._executor = None
+                    if hasattr(llm, "mpi_session"):
+                        llm.mpi_session = None
+                    del llm
             gc.collect()
             torch.cuda.empty_cache()
             return True
@@ -310,7 +339,9 @@ class TrtllmGenerationWorker:
             prompts.append({"prompt_token_ids": token_ids})
 
         sampling_params = self._build_sampling_params(greedy=greedy)
-        outputs = self.llm.generate(prompts, sampling_params=sampling_params)
+        outputs = []
+        for prompt in prompts:
+            outputs.extend(self.llm.generate([prompt], sampling_params=sampling_params))
 
         output_ids_list = []
         logprobs_list = []

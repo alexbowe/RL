@@ -256,6 +256,9 @@ class TrtllmGeneration(GenerationInterface):
         try:
             return self.worker_group.shutdown(cleanup_method="shutdown")
         except Exception as e:
+            message = str(e)
+            if "placement group was removed" in message or "actor died" in message:
+                return True
             print(f"Error during TRT-LLM shutdown: {e}")
             return False
 
