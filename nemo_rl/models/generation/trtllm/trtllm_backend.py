@@ -95,6 +95,34 @@ class NcclExtension(WorkerExtension):
         model_engine = self.engine.model_engine
         all_weights: dict[str, torch.Tensor] = {}
 
+        def _copy_weight(name: str, target: torch.Tensor, source: torch.Tensor) -> None:
+            if target.shape == source.shape:
+                target.copy_(source)
+                return
+            if (
+                source.ndim == 3
+                and target.ndim == 2
+                and source.shape[0] == target.shape[0]
+                and source.shape[1] == 1
+                and source.shape[2] == target.shape[1]
+            ):
+                target.copy_(source.squeeze(1))
+                return
+            if (
+                source.ndim == 3
+                and target.ndim == 2
+                and source.shape[0] == target.shape[0]
+                and source.shape[1] == target.shape[0]
+                and source.shape[2] == target.shape[1]
+            ):
+                converted = source.diagonal(dim1=0, dim2=1).transpose(0, 1).contiguous()
+                target.copy_(converted)
+                return
+            raise RuntimeError(
+                f"Shape mismatch for {name}: target={tuple(target.shape)} "
+                f"source={tuple(source.shape)}"
+            )
+
         def _accumulate(weights_list: list[tuple[str, torch.Tensor]]):
             for name, tensor in weights_list:
                 all_weights[name] = tensor
@@ -109,7 +137,7 @@ class NcclExtension(WorkerExtension):
 
             for pn, pp in model_engine.model.named_parameters():
                 if pn in all_weights:
-                    pp.data.copy_(all_weights[pn])
+                    _copy_weight(pn, pp.data, all_weights[pn])
                 elif pn.endswith("qkv_proj.weight"):
                     prefix = pn.replace("qkv_proj.weight", "")
                     q = all_weights.get(f"{prefix}q_proj.weight")
