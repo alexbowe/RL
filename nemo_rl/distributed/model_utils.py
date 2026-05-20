@@ -12,15 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
 from typing import Any, Optional
 
 import torch
-from megatron.core.models.gpt import GPTModel
-from megatron.core.parallel_state import (
-    get_tensor_model_parallel_group,
-    get_tensor_model_parallel_rank,
-)
-from megatron.core.utils import deprecate_inference_params, get_pg_size
 from torch.distributed.tensor import DTensor, distribute_tensor
 
 from nemo_rl.algorithms.logits_sampling_utils import (
@@ -28,6 +24,27 @@ from nemo_rl.algorithms.logits_sampling_utils import (
     apply_top_k_top_p,
     need_top_k_or_top_p_filtering,
 )
+
+
+def _require_megatron():
+    try:
+        from megatron.core.models.gpt import GPTModel
+        from megatron.core.parallel_state import (
+            get_tensor_model_parallel_group,
+            get_tensor_model_parallel_rank,
+        )
+        from megatron.core.utils import deprecate_inference_params, get_pg_size
+    except ImportError as exc:
+        raise ImportError(
+            "Megatron is required for Megatron-specific model utilities."
+        ) from exc
+    return (
+        GPTModel,
+        get_tensor_model_parallel_group,
+        get_tensor_model_parallel_rank,
+        deprecate_inference_params,
+        get_pg_size,
+    )
 
 
 @torch.no_grad()
@@ -2044,6 +2061,7 @@ class ChunkedDistributedHiddenStatesToLogprobs(torch.autograd.Function):
 
 
 def patch_gpt_model_forward_for_linear_ce_fusion(*, chunk_size: int) -> None:
+    GPTModel = _require_megatron()[0]
     if getattr(GPTModel, "_linear_ce_fusion_forward_patched", False):
         GPTModel._linear_ce_fusion_chunk_size = chunk_size
         return
@@ -2107,6 +2125,13 @@ def _gpt_forward_with_linear_ce_fusion(
     if labels is None:
         raise ValueError("labels must be provided when linear CE fusion is enabled")
 
+    (
+        _,
+        get_tensor_model_parallel_group,
+        get_tensor_model_parallel_rank,
+        deprecate_inference_params,
+        get_pg_size,
+    ) = _require_megatron()
     inference_context = deprecate_inference_params(inference_context, inference_params)
 
     preproc_output = self._preprocess(
