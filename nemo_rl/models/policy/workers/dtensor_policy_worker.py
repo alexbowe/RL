@@ -95,6 +95,13 @@ from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.packed_tensor import packed_broadcast_producer
 
 
+def _maybe_register_nemotron_h_model_alias(model: nn.Module) -> None:
+    """Register .model after FSDP state-dict loading for trust_remote_code Nemotron-H."""
+    inner_model = getattr(model, "backbone", None)
+    if inner_model is not None and not hasattr(model, "model"):
+        model.register_module("model", inner_model)
+
+
 def _attach_context_parallel_hooks(model: nn.Module) -> None:
     """Attach forward pre-hooks to self_attn modules for context parallelism.
 
@@ -427,6 +434,7 @@ class DTensorPolicyWorkerImpl(
                 broadcast_from_rank0=True,
             ),
         )
+        _maybe_register_nemotron_h_model_alias(self.model)
 
         # Handle tied word embeddings after loading the state dict
         # We need to actually tie the parameters at the model level
