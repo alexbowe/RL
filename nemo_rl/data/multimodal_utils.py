@@ -20,7 +20,6 @@ from collections import defaultdict
 from io import BytesIO
 from typing import Any, Optional, Union
 
-import decord
 import requests
 import torch
 from PIL import Image
@@ -65,6 +64,16 @@ MEDIA_TAG_PATTERN = re.compile(
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _import_decord():
+    try:
+        import decord
+    except ImportError as exc:
+        raise ImportError(
+            "decord/decord2 is required to load audio fallback data with decord."
+        ) from exc
+    return decord
 
 
 class PackedTensor:
@@ -359,7 +368,7 @@ def load_media_from_message(
                 except (RuntimeError, FileNotFoundError, OSError) as e:
                     logger.warning("Audio loading failed. Fall back to decord.")
                     # use decord
-                    loaded_audio = decord.AudioReader(
+                    loaded_audio = _import_decord().AudioReader(
                         aud,
                         sample_rate=multimodal_load_kwargs["audio"]["sampling_rate"],
                         mono=True,
