@@ -490,7 +490,9 @@ def _parallelize_nm5_h(
     }
 
     # NemotronH uses .backbone (trust_remote_code) or .model (native transformers >= 5.3.0)
-    inner_model = getattr(model, "backbone", model.model)
+    inner_model = getattr(model, "backbone", None)
+    if inner_model is None:
+        inner_model = model.model
     layers: torch.nn.ModuleList = inner_model.layers
 
     parallelize_module(model, tp_mesh, model_tp_plan)
@@ -530,12 +532,6 @@ def _parallelize_nm5_h(
         offload_policy=offload_policy,
         reshard_after_forward=False,
     )
-
-    # Register .model so the native transformers forward() (self.model(...)) resolves
-    # correctly after FSDP2 wrapping, regardless of whether the class uses .backbone
-    # (trust_remote_code) or .model (native transformers). kernel_patches.py wraps
-    # the native forward which always calls self.model(...).
-    result.register_module("model", inner_model)
 
     return result
 

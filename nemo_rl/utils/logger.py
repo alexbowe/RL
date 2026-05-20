@@ -87,7 +87,7 @@ class LoggerConfig(TypedDict):
     tensorboard: NotRequired[TensorboardConfig]
     swanlab: NotRequired[SwanlabConfig]
     mlflow: NotRequired[MLflowConfig]
-    mongodb: NotRequired["MongoDBLoggerConfig"]
+    mongodb: NotRequired[MongoDBLoggerConfig]
     monitor_gpus: bool
     gpu_monitoring: GPUMonitoringConfig
     num_val_samples_to_print: NotRequired[int]
