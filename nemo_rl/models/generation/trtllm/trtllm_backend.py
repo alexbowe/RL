@@ -55,17 +55,15 @@ class NcclExtension(WorkerExtension):
         world_size: int,
         train_world_size: int,
     ) -> None:
-        from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
-        from vllm.distributed.utils import StatelessProcessGroup
+        from nemo_rl.distributed.stateless_process_group import StatelessProcessGroup
 
         local_rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
         rank = train_world_size + rank_prefix + local_rank
 
-        pg = StatelessProcessGroup.create(
-            host=ip, port=port, rank=rank, world_size=world_size,
+        self.model_update_group = StatelessProcessGroup(
+            master_address=ip, port=port, rank=rank, world_size=world_size,
         )
-        device = torch.device("cuda", self.device_id)
-        self.model_update_group = PyNcclCommunicator(pg, device=device)
+        self.model_update_group.init_nccl_communicator(device=self.device_id)
 
     # ------------------------------------------------------------------ #
     #  Refit metadata (weight name → (shape, dtype) mapping)
