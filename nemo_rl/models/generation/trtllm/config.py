@@ -55,6 +55,7 @@ class TrtllmSpecificArgs(TypedDict):
     precision: NotRequired[str]
     max_batch_size: NotRequired[int]
     max_num_tokens: NotRequired[int]
+    return_perf_metrics: NotRequired[bool]
     speculative_decoding: NotRequired[SpeculativeDecodingArgs]
     expose_http_server: NotRequired[bool]
 

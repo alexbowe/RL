@@ -39,6 +39,44 @@ from nemo_rl.models.generation.interfaces import (
 from nemo_rl.models.generation.trtllm.config import SpeculativeDecodingArgs, TrtllmConfig
 
 
+_TRTLLM_SPECDEC_METRIC_KEYS = (
+    "proposed_draft_tokens",
+    "accepted_draft_tokens",
+    "target_forward_time_ms",
+    "draft_forward_time_ms",
+    "tar",
+    "draft_tokens_per_second",
+)
+
+
+def _extract_specdec_metrics(output: Any) -> dict[str, float]:
+    time_breakdown = getattr(output, "time_breakdown_metrics", None)
+    if not isinstance(time_breakdown, dict):
+        return {}
+
+    step_metrics = time_breakdown.get("specdec_step_metrics")
+    if not step_metrics:
+        return {}
+
+    totals = {key: 0.0 for key in _TRTLLM_SPECDEC_METRIC_KEYS}
+    for metric in step_metrics:
+        if not isinstance(metric, dict):
+            continue
+        for key in _TRTLLM_SPECDEC_METRIC_KEYS:
+            value = metric.get(key)
+            if isinstance(value, (int, float)):
+                totals[key] += float(value)
+
+    proposed = totals["proposed_draft_tokens"]
+    accepted = totals["accepted_draft_tokens"]
+    draft_ms = totals["draft_forward_time_ms"]
+    totals["tar"] = accepted / proposed if proposed > 0 else 0.0
+    totals["draft_tokens_per_second"] = (
+        proposed / (draft_ms / 1000.0) if draft_ms > 0 else 0.0
+    )
+    return totals
+
+
 
 def _build_speculative_config(spec_cfg: SpeculativeDecodingArgs):
     """Instantiate a tensorrt_llm speculative decoding config from our YAML dict."""
@@ -116,6 +154,9 @@ class TrtllmGenerationWorker:
         self.cfg = config
         self.model_name = self.cfg["model_name"]
         self.is_model_owner = bundle_indices is not None
+        self.return_perf_metrics = bool(
+            self.cfg["trtllm_cfg"].get("return_perf_metrics", False)
+        )
 
         if not self.is_model_owner:
             self.llm = None
@@ -168,6 +209,8 @@ class TrtllmGenerationWorker:
             cuda_graph_config=None,
             trust_remote_code=True,
         )
+        if self.return_perf_metrics:
+            llm_kwargs["return_perf_metrics"] = True
         kv_cache_kwargs: dict[str, Any] = {
             "enable_block_reuse": False,
             "max_tokens": max_num_tokens,
@@ -182,7 +225,20 @@ class TrtllmGenerationWorker:
         if disable_overlap:
             llm_kwargs["disable_overlap_scheduler"] = True
 
-        self.llm = tensorrt_llm.LLM(**llm_kwargs)
+        try:
+            self.llm = tensorrt_llm.LLM(**llm_kwargs)
+        except TypeError as e:
+            if self.return_perf_metrics and "return_perf_metrics" in str(e):
+                print(
+                    "[TrtllmWorker] TRTLLM does not support return_perf_metrics; "
+                    "continuing without specdec perf metrics",
+                    flush=True,
+                )
+                llm_kwargs.pop("return_perf_metrics", None)
+                self.return_perf_metrics = False
+                self.llm = tensorrt_llm.LLM(**llm_kwargs)
+            else:
+                raise
 
         self._http_thread = None
         self._http_base_url = None
@@ -348,6 +404,8 @@ class TrtllmGenerationWorker:
         generation_lengths = []
         unpadded_sequence_lengths = []
         spec_origins_list = []
+        specdec_available = []
+        specdec_metric_lists = {key: [] for key in _TRTLLM_SPECDEC_METRIC_KEYS}
 
         max_gen_len = max(len(o.outputs[0].token_ids) for o in outputs)
 
@@ -383,6 +441,12 @@ class TrtllmGenerationWorker:
                 full_origins[seq_len + idx] = origin
             spec_origins_list.append(full_origins)
 
+            if self.return_perf_metrics:
+                specdec_metrics = _extract_specdec_metrics(output)
+                specdec_available.append(1 if specdec_metrics else 0)
+                for key in _TRTLLM_SPECDEC_METRIC_KEYS:
+                    specdec_metric_lists[key].append(specdec_metrics.get(key, 0.0))
+
             resp_len = seq_len + len(gen_tokens)
             generation_lengths.append(len(gen_tokens))
             unpadded_sequence_lengths.append(resp_len)
@@ -395,6 +459,14 @@ class TrtllmGenerationWorker:
         }
         if any(o.sum() > 0 for o in spec_origins_list):
             result["spec_token_origins"] = torch.stack(spec_origins_list)
+        if self.return_perf_metrics:
+            result["trtllm_specdec_metrics_available"] = torch.tensor(
+                specdec_available, dtype=torch.bool
+            )
+            for key, values in specdec_metric_lists.items():
+                result[f"trtllm_specdec_{key}"] = torch.tensor(
+                    values, dtype=torch.float32
+                )
 
         return BatchedDataDict[GenerationOutputSpec](result)
 
@@ -422,7 +494,7 @@ class TrtllmGenerationWorker:
         temperature = 0.0 if greedy else self.cfg["temperature"]
         stop_ids = self.cfg.get("stop_token_ids") or []
 
-        return self.TrtSamplingParams(
+        kwargs = dict(
             temperature=temperature,
             top_p=self.cfg["top_p"],
             top_k=top_k_val,
@@ -430,3 +502,14 @@ class TrtllmGenerationWorker:
             end_id=stop_ids[0] if stop_ids else None,
             logprobs=True,
         )
+        if self.return_perf_metrics:
+            kwargs["return_perf_metrics"] = True
+
+        try:
+            return self.TrtSamplingParams(**kwargs)
+        except TypeError as e:
+            if "return_perf_metrics" in str(e):
+                kwargs.pop("return_perf_metrics", None)
+                self.return_perf_metrics = False
+                return self.TrtSamplingParams(**kwargs)
+            raise
