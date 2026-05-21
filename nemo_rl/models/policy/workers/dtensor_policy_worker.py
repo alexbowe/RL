@@ -337,6 +337,7 @@ class DTensorPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface):
                 model_config,
                 trust_remote_code=True,
             )
+        _maybe_disable_nemotron_h_fast_path(model_config, type(self.model))
 
         # Some model configs (e.g. Gemma3 in transformers v5) don't have pad_token_id
         # as a direct attribute. Use getattr to handle missing attribute gracefully.
