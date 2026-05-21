@@ -539,6 +539,31 @@ def print_performance_metrics(
             f"  • Mean Total Tokens per Sample: {metrics['mean_total_tokens_per_sample']:.2f}"
         )
 
+    if "trtllm/specdec/metrics_available_rate" in metrics:
+        print("  • TRTLLM Specdec Metrics:")
+        print(
+            "    - Metrics available rate: "
+            f"{metrics['trtllm/specdec/metrics_available_rate']:.2f}"
+        )
+        print(
+            "    - Draft tokens proposed/accepted: "
+            f"{metrics['trtllm/specdec/proposed_draft_tokens']:.0f}/"
+            f"{metrics['trtllm/specdec/accepted_draft_tokens']:.0f}"
+        )
+        print(f"    - TAR: {metrics['trtllm/specdec/tar']:.4f}")
+        print(
+            "    - Draft/generator forward time: "
+            f"{metrics['trtllm/specdec/draft_forward_time_ms']:.2f} ms"
+        )
+        print(
+            "    - Target/verifier forward time: "
+            f"{metrics['trtllm/specdec/target_forward_time_ms']:.2f} ms"
+        )
+        print(
+            "    - Proposed draft tokens/sec: "
+            f"{metrics['trtllm/specdec/proposed_draft_tokens_per_second']:.2f}"
+        )
+
     # =====================================================
     # vLLM Logger Metrics (inflight batch sizes, num pending samples, etc.)
     # =====================================================

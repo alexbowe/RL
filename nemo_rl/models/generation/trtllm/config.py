@@ -17,6 +17,25 @@ from typing import Any, NotRequired, TypedDict
 from nemo_rl.models.generation.interfaces import GenerationConfig
 
 
+class SpeculativeDecodingArgs(TypedDict, total=False):
+    """Maps to tensorrt_llm.llmapi speculative decoding config classes."""
+
+    method: str
+    max_draft_len: int
+    speculative_model: str
+    max_matching_ngram_size: int
+    is_public_pool: bool
+    num_nextn_predict_layers: int
+    mtp_eagle_one_model: bool
+    eagle3_one_model: bool
+    use_dynamic_tree: bool
+    greedy_sampling: bool
+    max_concurrency: int
+    draft_len_schedule: dict[int, int]
+    acceptance_window: int
+    acceptance_length_threshold: float
+
+
 class TrtllmSpecificArgs(TypedDict):
     tensor_parallel_size: int
     gpu_memory_utilization: NotRequired[float]
@@ -24,6 +43,8 @@ class TrtllmSpecificArgs(TypedDict):
     precision: NotRequired[str]
     max_batch_size: NotRequired[int]
     max_num_tokens: NotRequired[int]
+    return_perf_metrics: NotRequired[bool]
+    speculative_decoding: NotRequired[SpeculativeDecodingArgs]
     expose_http_server: NotRequired[bool]
     # Use tensorrt_llm._torch.async_llm.AsyncLLM instead of the sync LLM.
     # Async mode allows true concurrent generation (one in-flight request per

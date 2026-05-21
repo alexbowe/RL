@@ -54,6 +54,86 @@ from nemo_rl.utils.timer import Timer
 
 TokenizerType = PreTrainedTokenizerBase
 
+_TRTLLM_SPECDEC_INTERNAL_PREFIX = "_trtllm_specdec_"
+_TRTLLM_SPECDEC_NUMERIC_KEYS = (
+    "proposed_draft_tokens",
+    "accepted_draft_tokens",
+    "target_forward_time_ms",
+    "draft_forward_time_ms",
+)
+
+
+def _collect_trtllm_specdec_generation_metrics(
+    generation_outputs: BatchedDataDict[GenerationOutputSpec],
+) -> dict[str, float | int]:
+    available = generation_outputs.get("trtllm_specdec_metrics_available")
+    if available is None:
+        return {}
+
+    available_tensor = torch.as_tensor(available)
+    metrics: dict[str, float | int] = {
+        f"{_TRTLLM_SPECDEC_INTERNAL_PREFIX}total_samples": int(
+            available_tensor.numel()
+        ),
+        f"{_TRTLLM_SPECDEC_INTERNAL_PREFIX}available_samples": int(
+            available_tensor.to(torch.int32).sum().item()
+        ),
+    }
+    for key in _TRTLLM_SPECDEC_NUMERIC_KEYS:
+        values = generation_outputs.get(f"trtllm_specdec_{key}")
+        if values is not None:
+            metrics[f"{_TRTLLM_SPECDEC_INTERNAL_PREFIX}{key}"] = float(
+                torch.as_tensor(values).sum().item()
+            )
+    return metrics
+
+
+def _accumulate_trtllm_specdec_metrics(
+    totals: defaultdict[str, float],
+    metrics: dict[str, Any],
+) -> None:
+    for key, value in metrics.items():
+        if key.startswith(_TRTLLM_SPECDEC_INTERNAL_PREFIX) and isinstance(
+            value, (int, float)
+        ):
+            totals[key] += float(value)
+
+
+def _finalize_trtllm_specdec_metrics(
+    totals: defaultdict[str, float],
+) -> dict[str, float]:
+    total_samples = totals.get(f"{_TRTLLM_SPECDEC_INTERNAL_PREFIX}total_samples", 0.0)
+    if total_samples == 0:
+        return {}
+
+    available_samples = totals.get(
+        f"{_TRTLLM_SPECDEC_INTERNAL_PREFIX}available_samples", 0.0
+    )
+    proposed = totals.get(
+        f"{_TRTLLM_SPECDEC_INTERNAL_PREFIX}proposed_draft_tokens", 0.0
+    )
+    accepted = totals.get(
+        f"{_TRTLLM_SPECDEC_INTERNAL_PREFIX}accepted_draft_tokens", 0.0
+    )
+    target_ms = totals.get(
+        f"{_TRTLLM_SPECDEC_INTERNAL_PREFIX}target_forward_time_ms", 0.0
+    )
+    draft_ms = totals.get(
+        f"{_TRTLLM_SPECDEC_INTERNAL_PREFIX}draft_forward_time_ms", 0.0
+    )
+
+    return {
+        "trtllm/specdec/metrics_available_rate": available_samples / total_samples,
+        "trtllm/specdec/proposed_draft_tokens": proposed,
+        "trtllm/specdec/accepted_draft_tokens": accepted,
+        "trtllm/specdec/target_forward_time_ms": target_ms,
+        "trtllm/specdec/draft_forward_time_ms": draft_ms,
+        "trtllm/specdec/tar": accepted / proposed if proposed > 0 else 0.0,
+        "trtllm/specdec/proposed_draft_tokens_per_second": (
+            proposed / (draft_ms / 1000.0) if draft_ms > 0 else 0.0
+        ),
+    }
+
 
 def generate_responses(
     policy_generation: GenerationInterface,
@@ -118,6 +198,7 @@ def generate_responses(
         "mean_generation_length": generation_lengths.float().mean().item(),
         "total_generated_tokens": generation_lengths.sum().item(),
     }
+    gen_metrics.update(_collect_trtllm_specdec_generation_metrics(generation_outputs))
 
     # Add response_truncated to gen_metrics for use by caller
     if response_truncated is not None:
@@ -224,6 +305,7 @@ async def generate_responses_async(
         "mean_generation_length": generation_lengths.float().mean().item(),
         "total_generated_tokens": generation_lengths.sum().item(),
     }
+    gen_metrics.update(_collect_trtllm_specdec_generation_metrics(generation_outputs))
     # Attach worker metadata if present (async vLLM path)
     if "gen_leader_worker_idx" in generation_outputs:
         # generation_outputs carries this as a 1-length list per row; convert to int
@@ -404,6 +486,7 @@ def run_multi_turn_rollout(
     # Tracking per-turn metrics
     total_gen_tokens_per_turn = []
     active_samples_per_turn = []
+    trtllm_specdec_totals: defaultdict[str, float] = defaultdict(float)
 
     for turn in range(max_rollout_turns):
         if len(active_indices) == 0:
@@ -457,6 +540,7 @@ def run_multi_turn_rollout(
             input_lengths=active_input_lengths,
             greedy=greedy,
         )
+        _accumulate_trtllm_specdec_metrics(trtllm_specdec_totals, gen_metrics)
 
         # Record response truncation (response hit max_tokens without stop token)
         response_truncated = gen_metrics.pop("_response_truncated", None)
@@ -600,6 +684,7 @@ def run_multi_turn_rollout(
             sample_env_token_counts.float().mean().item()
         ),
     }
+    rollout_metrics.update(_finalize_trtllm_specdec_metrics(trtllm_specdec_totals))
     return current_batch, rollout_metrics
 
 
@@ -724,6 +809,7 @@ async def run_sample_multi_turn_rollout(
     turn_total_tokens = []
     # Track per-turn per-worker token accounting if available
     per_worker_token_counts = {}  # worker_idx -> token_count
+    trtllm_specdec_totals: defaultdict[str, float] = defaultdict(float)
 
     for turn in range(max_rollout_turns):
         if terminated or truncated:
@@ -766,6 +852,7 @@ async def run_sample_multi_turn_rollout(
                 per_worker_token_counts[worker_idx] = (
                     per_worker_token_counts.get(worker_idx, 0) + gen_token_count
                 )
+            _accumulate_trtllm_specdec_metrics(trtllm_specdec_totals, gen_metrics)
 
         except Exception as e:
             print(f"Error generating response for sample {sample_idx}: {e}")
@@ -869,6 +956,7 @@ async def run_sample_multi_turn_rollout(
         # Pass-through per-worker per-turn accounting for aggregation at batch level
         "per_worker_token_counts": per_worker_token_counts,
     }
+    sample_metrics.update(dict(trtllm_specdec_totals))
 
     return final_sample_state, sample_metrics
 
@@ -1042,6 +1130,10 @@ def run_async_multi_turn_rollout(
             "max_total_reward": max(m["total_reward"] for m in all_sample_metrics),
             "min_total_reward": min(m["total_reward"] for m in all_sample_metrics),
         }
+        trtllm_specdec_totals: defaultdict[str, float] = defaultdict(float)
+        for m in all_sample_metrics:
+            _accumulate_trtllm_specdec_metrics(trtllm_specdec_totals, m)
+        rollout_metrics.update(_finalize_trtllm_specdec_metrics(trtllm_specdec_totals))
 
         # Calculate per-worker token counts
         if "per_worker_token_counts" in all_sample_metrics[0]:
