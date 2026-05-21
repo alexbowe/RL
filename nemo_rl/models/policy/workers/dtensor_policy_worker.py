@@ -16,6 +16,7 @@ import contextlib
 import gc
 import itertools
 import os
+import sys
 import warnings
 from collections import defaultdict
 from contextlib import AbstractContextManager, contextmanager, nullcontext
@@ -99,6 +100,19 @@ def _maybe_register_nemotron_h_model_alias(model: nn.Module) -> None:
     inner_model = getattr(model, "backbone", None)
     if inner_model is not None and not hasattr(model, "model"):
         model.register_module("model", inner_model)
+
+
+def _maybe_disable_nemotron_h_fast_path(model_config: Any, model_class: type) -> None:
+    """Honor Nemotron-H's use_mamba_kernels=false config flag in HF remote code."""
+    if getattr(model_config, "model_type", None) != "nemotron_h":
+        return
+    if getattr(model_config, "use_mamba_kernels", True) is not False:
+        return
+
+    module = sys.modules.get(model_class.__module__)
+    if module is not None and hasattr(module, "is_fast_path_available"):
+        module.is_fast_path_available = False
+        print("Disabled Nemotron-H fast Mamba kernels via use_mamba_kernels=false")
 
 
 def _attach_context_parallel_hooks(model: nn.Module) -> None:
@@ -300,6 +314,8 @@ class DTensorPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface):
         else:
             # DO NOT assume AutoModelForCausalLM, multimodal models can inherit from AutoModelForImageTextToText, AutoModelForTextToWaveform, etc.
             model_class = resolve_model_class(model_config.model_type)
+
+        _maybe_disable_nemotron_h_fast_path(model_config, model_class)
 
         full_state_dict = None
         if self.rank == 0:
